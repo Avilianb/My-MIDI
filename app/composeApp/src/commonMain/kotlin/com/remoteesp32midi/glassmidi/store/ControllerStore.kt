@@ -55,7 +55,8 @@ class ControllerStore(
             val persisted = runCatching { layoutStore.load() }.getOrElse {
                 PersistedState()
             }
-            val controls = persisted.layout.controls.filter { validateControl(it, emptyList(), it.id) == null }
+            val rawControls = persisted.layout.controls
+            val controls = migrateLoadedControls(rawControls)
             _state.update {
                 it.copy(
                     controls = controls,
@@ -63,6 +64,10 @@ class ControllerStore(
                     lastDeviceName = persisted.deviceName,
                     loaded = true,
                 )
+            }
+            if (controls != rawControls) {
+                // 旧版本 14-bit 控件可能使用任意 CC 编号；迁移后落盘一次。
+                scheduleSave()
             }
         }
 
@@ -354,6 +359,31 @@ class ControllerStore(
         if (control.value == clamped) return false
         updateValue(id, clamped)
         return true
+    }
+
+    /**
+     * 旧版本允许 14-bit 控件使用任意 CC 编号。迁移到标准的 MSB 0..31，
+     * 按原顺序为冲突/越界控件选择同通道内第一个空闲 MSB，避免静默丢失布局。
+     */
+    private fun migrateLoadedControls(raw: List<Control>): List<Control> {
+        val accepted = ArrayList<Control>(raw.size)
+        for (control in raw) {
+            if (validateControl(control, accepted, control.id) == null) {
+                accepted += control
+                continue
+            }
+            val needsStandardMsb = control.kind != ControlKind.BUTTON &&
+                control.mapping.type == MidiType.CC &&
+                control.mapping.resolution == MidiResolution.FOURTEEN_BIT
+            if (!needsStandardMsb) continue
+
+            val remapped = (1..31).toList().plus(0).firstNotNullOfOrNull { msb ->
+                control.copy(mapping = control.mapping.copy(number = msb))
+                    .takeIf { validateControl(it, accepted, it.id) == null }
+            }
+            if (remapped != null) accepted += remapped
+        }
+        return accepted
     }
 
     private fun flushPendingContinuous() {

@@ -5,10 +5,12 @@ import com.remoteesp32midi.glassmidi.ble.BleMidiTransport
 import com.remoteesp32midi.glassmidi.ble.TransportEvent
 import com.remoteesp32midi.glassmidi.model.Control
 import com.remoteesp32midi.glassmidi.model.ControlKind
+import com.remoteesp32midi.glassmidi.model.Layout
 import com.remoteesp32midi.glassmidi.model.MidiMessage
 import com.remoteesp32midi.glassmidi.model.MidiResolution
 import com.remoteesp32midi.glassmidi.model.MidiType
 import com.remoteesp32midi.glassmidi.model.PersistedState
+import com.remoteesp32midi.glassmidi.model.validateControl
 import com.remoteesp32midi.glassmidi.storage.LayoutStore
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
@@ -269,6 +271,27 @@ class ControllerStoreTest {
     }
 
     @Test
+    fun legacyFourteenBitMappingIsMigratedToStandardMsb() = runTest {
+        val legacy = Control(
+            id = "legacy",
+            label = "Old Cutoff",
+            kind = ControlKind.KNOB,
+            mapping = androidxMidiMapping(MidiType.CC, 1, 60, 14),
+        )
+        val store = ControllerStore(
+            FakeTransport(),
+            InMemoryLayoutStore(PersistedState(layout = Layout(controls = listOf(legacy)))),
+            backgroundScope,
+        )
+        runCurrent()
+
+        val migrated = store.state.value.controls.single()
+        assertEquals("Old Cutoff", migrated.label)
+        assertTrue(migrated.mapping.number in 0..31)
+        assertEquals(null, validateControl(migrated, emptyList(), migrated.id))
+    }
+
+    @Test
     fun transportEventsUpdateConnectionAndDevices() = runTest {
         val transport = FakeTransport()
         val store = ControllerStore(transport, InMemoryLayoutStore(), backgroundScope)
@@ -332,10 +355,12 @@ private class FakeTransport : BleMidiTransport {
     }
 }
 
-private class InMemoryLayoutStore : LayoutStore {
+private class InMemoryLayoutStore(
+    private val initial: PersistedState = PersistedState(),
+) : LayoutStore {
     var saved: PersistedState? = null
 
-    override suspend fun load(): PersistedState = PersistedState()
+    override suspend fun load(): PersistedState = initial
 
     override suspend fun save(state: PersistedState) {
         saved = state
