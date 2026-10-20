@@ -174,7 +174,8 @@ void ble_midi_link_get_stats(ble_midi_link_stats_t *out);
   - Copy the name into `config.device_name` with `strlcpy`.
   - Set `config.include_service_uuid = 1`, `config.adv_uuid_type = BLE_CONN_UUID_TYPE_128`.
   - Copy `BLE_MIDI_SERVICE_UUID128` into `config.adv_uuid128`.
-  - Call in this order: `esp_ble_conn_init(&config)`, `esp_ble_conn_set_mtu(185)` (legacy compatibility), `esp_ble_midi_svc_init()`, `esp_ble_midi_profile_init()`, `esp_ble_midi_register_event_cb()`, `esp_event_handler_register(BLE_CONN_MGR_EVENTS, ESP_EVENT_ANY_ID, conn_event_handler, NULL)`.
+  - With `CONFIG_BLE_CONN_MGR_EXTENDED_ADV=y`, `ble_conn_mgr` does **not** auto-append the service UUID. Build an explicit AD payload containing Flags + Complete 128-bit Service UUID + Complete Local Name; put it in `extended_adv_data`. NimBLE rejects non-legacy `connectable + scannable`, so use a connectable-only non-legacy PDU (or a legacy PDU with a payload <=31 bytes; UUID+name does not fit).
+  - Call in this order: `esp_ble_conn_init(&config)`, `esp_ble_midi_svc_init()`, `esp_ble_midi_profile_init()`, `esp_ble_midi_register_event_cb()`, `esp_event_handler_register(BLE_CONN_MGR_EVENTS, ESP_EVENT_ANY_ID, conn_event_handler, NULL)`. Do not call `esp_ble_conn_set_mtu()`; it is a legacy no-op and logs a warning. Request MTU with `esp_ble_conn_mtu_update()` after connect.
   - Store `cb`; a NULL callback is allowed and drops parsed MIDI.
 - `ble_midi_link_start()` calls `esp_ble_conn_start()`.
 - `ble_midi_link_ready()` returns `s_connected && esp_ble_midi_is_notify_enabled()`.
@@ -232,7 +233,7 @@ idf_component_register(SRCS "tusb_midi_main.c" "ble_midi_link.c"
 Run from PowerShell:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Remove-Item Env:MSYSTEM -ErrorAction SilentlyContinue; & 'C:\Espressif\esp-idf-v5.5.2\export.ps1'; Set-Location 'C:\Users\woo\Desktop\remoteesp32midi'; Remove-Item firmware\sdkconfig -ErrorAction SilentlyContinue; idf.py -C firmware fullclean; idf.py -C firmware build"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Remove-Item Env:MSYSTEM -ErrorAction SilentlyContinue; & 'C:\Espressif\esp-idf-v5.5.2\export.ps1'; Set-Location 'C:\Users\woo\Desktop\remoteesp32midi'; Remove-Item firmware\build -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item firmware\sdkconfig -Force -ErrorAction SilentlyContinue; idf.py -C firmware set-target esp32s3; idf.py -C firmware build"
 ```
 
 Expected: `Project build complete`. If component resolution fails, capture the failing component/version and stop; do not hand-edit downloaded components.
