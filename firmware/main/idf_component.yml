@@ -2,4 +2,10 @@
 dependencies:
   espressif/esp_tinyusb:
     version: "^2.0.0"
+  espressif/ble_midi:
+    version: "0.1.0~2"
+  espressif/ble_conn_mgr:
+    version: "~1.*"
+  espressif/ble_services:
+    version: "~1.*"
   idf: "^5.0"

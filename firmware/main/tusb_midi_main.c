@@ -13,6 +13,9 @@
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "esp_timer.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "ble_midi_link.h"
 
 static const char *TAG = "example";
 
@@ -148,6 +151,19 @@ void app_main(void)
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
 
     ESP_LOGI(TAG, "USB initialization DONE");
+
+    // BLE 初始化：NVS 保存 BLE 协议栈状态，event loop 供 ble_conn_mgr 使用。
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_ret);
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // Task 1 暂不接桥接回调；Task 2 会替换成 midi_bridge_on_ble_midi。
+    ESP_ERROR_CHECK(ble_midi_link_init(NULL));
+    ESP_ERROR_CHECK(ble_midi_link_start());
 
     // Send Note On/Off every 500 ms.
     int const period_ms = 500;
