@@ -20,8 +20,8 @@ Windows / macOS / Linux + DAW
 | 1 技术选型 | 已确认：ESP-IDF + Compose Multiplatform(Android) + 标准 BLE-MIDI |
 | 2 USB-MIDI 单独跑通 | 已完成 |
 | 3 BLE 桥接 + nRF Connect 验收 | 已完成（固件 README 有实测记录） |
-| 4 Android App 连接 + 基础控件 | 代码与模拟器 UI 已验证；真机 + ESP32 待验收 |
-| 5 双向反馈、配置/布局保存 | 布局保存已提前完成；回传 UI 与多页布局待做 |
+| 4 Android App 连接 + 基础控件 | 真机扫描/连接已验证；控件与持久化完成 |
+| 5 双向反馈、配置/布局保存 | 回传 UI、14-bit 配对、布局保存已实现；DAW 回传实测待做 |
 
 ## 快速构建
 

@@ -47,6 +47,7 @@ class ControllerStore(
     val state: StateFlow<UiState> = _state.asStateFlow()
 
     private val pendingContinuous = MutableStateFlow<Map<String, Int>>(emptyMap())
+    private val pendingFourteenBit = mutableMapOf<Pair<Int, Int>, Int>()
     private var saveJob: Job? = null
 
     init {
@@ -98,6 +99,7 @@ class ControllerStore(
                                 .forEach { sendContinuous(it, it.value) }
                         } else {
                             pendingContinuous.value = emptyMap()
+                            pendingFourteenBit.clear()
                         }
                         if (connection.phase == ConnectionPhase.READY ||
                             connection.phase == ConnectionPhase.ERROR
@@ -111,9 +113,9 @@ class ControllerStore(
             }
         }
 
-        // 回传在阶段 5 接入；这里先保持订阅，避免通知数据阻塞 BLE 回调。
+        // USB/DAW → ESP32 → 手机：只更新 UI，不回写到 BLE。
         scope.launch {
-            transport.incoming.collect { }
+            transport.incoming.collect { messages -> applyIncoming(messages) }
         }
 
         scope.launch {
@@ -272,6 +274,88 @@ class ControllerStore(
         }
     }
 
+    /**
+     * 处理 DAW 回传：Note/7-bit CC 直接更新 Button；14-bit CC 先缓存 MSB，
+     * 收到 LSB 后合并。这里只改 UI 状态，绝不调用 transport.send，避免回环。
+     */
+    private fun applyIncoming(messages: List<MidiMessage>) {
+        if (messages.isEmpty()) return
+        var changed = false
+        val controls = _state.value.controls
+
+        for (message in messages) {
+            if (!message.isChannelVoice) continue
+            val channel = message.channel + 1
+            when {
+                message.isNoteOn || message.isNoteOff -> {
+                    val velocity = if (message.isNoteOn) message.data2 ?: 0 else 0
+                    controls.forEach { control ->
+                        if (control.kind == ControlKind.BUTTON &&
+                            control.mapping.type == MidiType.NOTE &&
+                            control.mapping.channel == channel &&
+                            control.mapping.number == message.data1
+                        ) {
+                            changed = setFeedbackValue(control.id, velocity) || changed
+                        }
+                    }
+                }
+
+                message.command == 0xB0 -> {
+                    val controller = message.data1
+                    val value = message.data2 ?: continue
+
+                    controls.forEach { control ->
+                        if (control.kind == ControlKind.BUTTON &&
+                            control.mapping.type == MidiType.CC &&
+                            control.mapping.resolution == MidiResolution.SEVEN_BIT &&
+                            control.mapping.channel == channel &&
+                            control.mapping.number == controller
+                        ) {
+                            changed = setFeedbackValue(control.id, value) || changed
+                        }
+                    }
+
+                    controls.forEach { control ->
+                        if (control.kind == ControlKind.BUTTON ||
+                            control.mapping.type != MidiType.CC ||
+                            control.mapping.resolution != MidiResolution.FOURTEEN_BIT ||
+                            control.mapping.channel != channel
+                        ) {
+                            return@forEach
+                        }
+                        when (controller) {
+                            control.mapping.number -> {
+                                pendingFourteenBit[channel to controller] = value
+                                // 先用 MSB 粗调，LSB 到达后再补齐低 7 位。
+                                changed = setFeedbackValue(control.id, value shl 7) || changed
+                            }
+
+                            control.mapping.number + 32 -> {
+                                val high = pendingFourteenBit.remove(channel to control.mapping.number)
+                                if (high != null) {
+                                    changed = setFeedbackValue(
+                                        control.id,
+                                        (high shl 7) or value,
+                                    ) || changed
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (changed) scheduleSave()
+    }
+
+    private fun setFeedbackValue(id: String, value: Int): Boolean {
+        val control = _state.value.controls.find { it.id == id } ?: return false
+        val clamped = value.coerceIn(control.kind.valueRange())
+        if (control.value == clamped) return false
+        updateValue(id, clamped)
+        return true
+    }
+
     private fun flushPendingContinuous() {
         val snapshot = pendingContinuous.value
         if (snapshot.isEmpty()) return
@@ -295,7 +379,8 @@ class ControllerStore(
         transport.send(
             listOf(
                 MidiMessage.controlChange(channel, number, msb),
-                MidiMessage.controlChange(channel, number + 1, lsb),
+                // 标准 14-bit CC：MSB 0..31，LSB 固定为 MSB + 32。
+                MidiMessage.controlChange(channel, number + 32, lsb),
             )
         )
     }

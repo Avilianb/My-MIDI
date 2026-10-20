@@ -3,7 +3,7 @@
 手机端通过标准 BLE-MIDI（GATT）连接 ESP32-S3，向固件发送 Note/CC，并接收固件回传的
 USB→BLE 消息。界面使用 Compose Multiplatform + Backdrop 液态玻璃效果。
 
-当前阶段：**阶段 4（连接 + 基础控件）已完成代码和模拟器 UI 验证；手机 + ESP32 硬件验收待做。**
+当前阶段：**阶段 5（双向反馈、14-bit 配对、布局保存）代码完成；DAW 回传真机验收待做。**
 
 ## 技术栈
 
@@ -68,7 +68,7 @@ iOS target；`composeApp` 的公共代码未使用 Android API，后续可按 KM
 2. 点右上角“扫描”，选择 `ESP32-S3 MIDI`。连接成功后状态变为“已连接”。
 3. 点“添加控件”，选择 Button / Knob / Fader：
    - Button：Note 或 7-bit CC，按下 127，松开 0 / Note Off。
-   - Knob/Fader：固定 14-bit CC；MSB 为编号，LSB 自动使用 `MSB + 1`。
+   - Knob/Fader：固定 14-bit CC；MSB 为编号（0–31），LSB 自动使用 `MSB + 32`。
    - 通道 1–16 可调；名称、MIDI 类型、编号可在编辑器中修改。
 4. 旋钮上下拖动，推子上下拖动；值范围 0–16383。松手立即发送最终值，拖动期间每 10 ms
    最多发送一帧，避免 BLE 写队列被淹没。
@@ -108,12 +108,11 @@ App 严格使用标准 BLE-MIDI：
 
 ### 14-bit 规则
 
-- 编号范围 0–126；LSB 固定 `编号 + 1`。
+- 编号范围 0–31；LSB 固定 `编号 + 32`（例如 CC1 → CC33）。
 - 不允许两个 14-bit 对共享同一通道的任一 CC 编号；也不允许 14-bit 对与 7-bit CC 控件
   使用相同的 CC 编号（编辑器会实时提示）。
 - 7-bit Button CC 可以与另一个 7-bit CC 共用编号，但回传时两个控件都会响应，建议避免。
-- 收到 `CC MSB` 时先记下高 7 位；收到 `CC MSB+1` 时合并为 0–16383。阶段 5 会把回传
-  值写回 Knob/Fader 的 UI。
+- 收到 `CC MSB` 时先记下高 7 位并按粗值更新 UI；收到 `CC MSB+32` 时合并为 0–16383。
 
 ## 阶段 4 验收
 
@@ -153,6 +152,36 @@ App 严格使用标准 BLE-MIDI：
 | 旋钮连续转动流畅、不丢包 | 10 ms 合并节流 + 单写队列 + 松手强制最终值；待真机手感/丢包验收 |
 | 断开重连后功能正常 | 自动退避重连、Ready 重发连续值、Button 清零；待真机验收 |
 
+## 阶段 5：双向反馈
+
+### 已实现
+
+- `ControllerStore` 消费 `transport.incoming`，按 `(通道, Note/CC 编号, 分辨率)` 匹配控件。
+- Button + Note：Note On 更新为 velocity，Note Off/velocity 0 归零。
+- Button + 7-bit CC：直接更新 0–127。
+- Knob/Fader + 14-bit CC：缓存 MSB（按粗值更新），收到 `MSB + 32` 后合并为 0–16383。
+- 回传只更新 UI/持久化，不调用 `transport.send`，不会形成 BLE 回环。
+- 断开/重连清除未完成的 14-bit MSB；UI 值在 300 ms 防抖后写回 `layout.json`。
+- Knob/Fader 的本地拖动状态会在外部回传到达时同步；拖动期间不被回传打断。
+
+### 测试步骤
+
+1. 连接 ESP32-S3，在 DAW 中向 `ESP32-S3 MIDI Bridge` 发送 CC1=64、CC33=0；
+   App 的 Knob CC1 应显示 8192。
+2. 再发送 CC1=64、CC33=127；应显示 8319。
+3. 播放包含 Note 60/CC20 的 MIDI clip；对应 Button 应点亮/熄灭或显示 CC 值。
+4. 确认 App 不会把回传值再次发回 BLE（DAW 不会出现回环 CC）。
+5. 外部回传后杀掉 App 重开，最后一次控件值应恢复。
+
+### 状态
+
+| 项目 | 结果 |
+|---|---|
+| 回传映射 | 单元测试覆盖 Note/CC/14-bit/orphan LSB，全部通过 |
+| 回传不发送 | 单元测试断言 `transport.sent` 不增加 |
+| 持久化 | 沿用布局保存和 300 ms 防抖 |
+| 真机 DAW 回传 | 待用户按上面步骤验证 |
+
 ### 扫描不到设备
 
 1. ESP32-S3 同一时间只允许一个 BLE central。先断开系统蓝牙、nRF Connect、LightBlue
@@ -164,13 +193,11 @@ App 严格使用标准 BLE-MIDI：
    - nRF Connect 也看不到：ESP 没有广播，通常是被其他 central 占用或未上电。
    - nRF Connect 能看到、App 看不到：抓 `adb logcat`，过滤 `GlassMidiBle` 后反馈。
 
-## 已知限制（阶段 5 处理）
+## 已知限制
 
-- **回传 UI 尚未接线**：`ControllerStore` 目前丢弃 `transport.incoming`；阶段 5 会按
-  `(通道, CC/Note, 分辨率)` 找到控件并更新显示，处理 14-bit 配对超时。
 - 布局保存已实现，但还没有拖拽排序、删除确认、页面切换/多页布局。
+- 回传只更新当前页控件；不保存 DAW 的自动化历史。
 - 没有 USB 挂载状态查询；固件当前不提供该 GATT 状态。
 - 没有 BLE bonding/加密；与固件当前开放外设一致。
 - 只支持单 BLE 连接；前台服务在连接期间保持，系统可能因省电策略杀进程。
-- 图标暂用系统占位图；后续可换自适应图标。
 - iOS 未配置 target；公共层已避免 Android 依赖，但 BLE/存储/权限需另写 actual 实现。

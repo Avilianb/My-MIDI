@@ -17,8 +17,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -161,7 +163,12 @@ private fun KnobControl(
     onFinished: () -> Unit,
 ) {
     var dragValue by remember(control.id) { mutableFloatStateOf(control.value.toFloat()) }
+    var isDragging by remember(control.id) { mutableStateOf(false) }
     val fraction = (dragValue / 16383f).coerceIn(0f, 1f)
+    // 外部回传更新 control.value 时同步指针；拖动期间不被回传打断。
+    LaunchedEffect(control.value, isDragging) {
+        if (!isDragging) dragValue = control.value.toFloat()
+    }
     // 整个旋钮拖动约 200 dp 覆盖 0..16383，避免不同屏幕密度下手感差异。
     val unitsPerPixel = with(LocalDensity.current) { 16383f / 200.dp.toPx() }
     Box(
@@ -175,9 +182,18 @@ private fun KnobControl(
                 .size(132.dp)
                 .pointerInput(control.id, unitsPerPixel) {
                     detectVerticalDragGestures(
-                        onDragStart = { dragValue = control.value.toFloat() },
-                        onDragEnd = { onFinished() },
-                        onDragCancel = { onFinished() },
+                        onDragStart = {
+                            isDragging = true
+                            dragValue = control.value.toFloat()
+                        },
+                        onDragEnd = {
+                            isDragging = false
+                            onFinished()
+                        },
+                        onDragCancel = {
+                            isDragging = false
+                            onFinished()
+                        },
                     ) { change, dragAmount ->
                         change.consume()
                         dragValue = (dragValue - dragAmount * unitsPerPixel).coerceIn(0f, 16383f)
@@ -242,7 +258,12 @@ private fun FaderControl(
     onFinished: () -> Unit,
 ) {
     var dragValue by remember(control.id) { mutableFloatStateOf(control.value.toFloat()) }
+    var isDragging by remember(control.id) { mutableStateOf(false) }
     val fraction = (dragValue / 16383f).coerceIn(0f, 1f)
+    // 外部回传更新 control.value 时同步滑块；拖动期间不被回传打断。
+    LaunchedEffect(control.value, isDragging) {
+        if (!isDragging) dragValue = control.value.toFloat()
+    }
     // 拖动整条 132 dp 轨道正好覆盖 0..16383，保证推子行程与显示一致。
     val unitsPerPixel = with(LocalDensity.current) { 16383f / 132.dp.toPx() }
     Row(
@@ -258,9 +279,18 @@ private fun FaderControl(
                 .height(132.dp)
                 .pointerInput(control.id, unitsPerPixel) {
                     detectVerticalDragGestures(
-                        onDragStart = { dragValue = control.value.toFloat() },
-                        onDragEnd = { onFinished() },
-                        onDragCancel = { onFinished() },
+                        onDragStart = {
+                            isDragging = true
+                            dragValue = control.value.toFloat()
+                        },
+                        onDragEnd = {
+                            isDragging = false
+                            onFinished()
+                        },
+                        onDragCancel = {
+                            isDragging = false
+                            onFinished()
+                        },
                     ) { change, dragAmount ->
                         change.consume()
                         dragValue = (dragValue - dragAmount * unitsPerPixel).coerceIn(0f, 16383f)
@@ -305,7 +335,7 @@ fun com.remoteesp32midi.glassmidi.model.MidiMapping.displayLabel(): String =
     when (type) {
         MidiType.NOTE -> "Note ${number} · CH ${channel}"
         MidiType.CC -> if (resolution == MidiResolution.FOURTEEN_BIT) {
-            "CC ${number}/${number + 1} · CH ${channel}"
+            "CC ${number}/${number + 32} · CH ${channel}"
         } else {
             "CC ${number} · CH ${channel}"
         }

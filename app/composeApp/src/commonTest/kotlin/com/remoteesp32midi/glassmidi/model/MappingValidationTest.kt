@@ -39,24 +39,24 @@ class MappingValidationTest {
     }
 
     @Test
-    fun fourteenBitNumberMustLeaveRoomForLsb() {
-        val invalid = control("k", ControlKind.KNOB, MidiType.CC, 1, 127, MidiResolution.FOURTEEN_BIT)
+    fun fourteenBitMsbMustBeInRangeZeroTo31() {
+        val invalid = control("k", ControlKind.KNOB, MidiType.CC, 1, 32, MidiResolution.FOURTEEN_BIT)
         assertNotNull(validateControl(invalid, emptyList()))
     }
 
     @Test
     fun fourteenBitPairCannotOverlapSevenBitCc() {
-        val existing = control("c", ControlKind.BUTTON, MidiType.CC, 1, 2, MidiResolution.SEVEN_BIT)
+        val existing = control("c", ControlKind.BUTTON, MidiType.CC, 1, 33, MidiResolution.SEVEN_BIT)
         val candidate = control("k", ControlKind.KNOB, MidiType.CC, 1, 1, MidiResolution.FOURTEEN_BIT)
         val error = validateControl(candidate, listOf(existing))
         assertNotNull(error)
-        assertEquals(true, error.contains("CC 2"))
+        assertEquals(true, error.contains("CC 33"))
     }
 
     @Test
-    fun twoFourteenBitPairsCannotShareNumbers() {
+    fun twoFourteenBitPairsCannotShareSameMsb() {
         val existing = control("k1", ControlKind.KNOB, MidiType.CC, 1, 1, MidiResolution.FOURTEEN_BIT)
-        val candidate = control("k2", ControlKind.KNOB, MidiType.CC, 1, 2, MidiResolution.FOURTEEN_BIT)
+        val candidate = control("k2", ControlKind.KNOB, MidiType.CC, 1, 1, MidiResolution.FOURTEEN_BIT)
         assertNotNull(validateControl(candidate, listOf(existing)))
     }
 

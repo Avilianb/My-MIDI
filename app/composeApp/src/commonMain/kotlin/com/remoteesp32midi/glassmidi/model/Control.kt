@@ -18,7 +18,7 @@ enum class MidiResolution {
 
 /**
  * channel 是界面使用的 1..16；number 是 Note 编号或 CC 的 MSB 编号。
- * 14-bit CC 占用 number（MSB）和 number + 1（LSB）两个编号。
+ * 标准 14-bit CC 占用 number（MSB）和 number + 32（LSB）两个编号。
  */
 data class MidiMapping(
     val type: MidiType,

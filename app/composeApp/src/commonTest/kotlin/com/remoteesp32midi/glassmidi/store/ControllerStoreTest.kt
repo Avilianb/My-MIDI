@@ -51,6 +51,76 @@ class ControllerStoreTest {
     }
 
     @Test
+    fun incomingNoteAndCcUpdateControlsWithoutSending() = runTest {
+        val transport = FakeTransport()
+        val store = ControllerStore(transport, InMemoryLayoutStore(), backgroundScope)
+        runCurrent()
+
+        store.upsertControl(
+            Control(
+                id = "",
+                label = "Pad",
+                kind = ControlKind.BUTTON,
+                mapping = androidxMidiMapping(MidiType.NOTE, 1, 60, 7),
+            )
+        )
+        store.upsertControl(
+            Control(
+                id = "",
+                label = "Mute",
+                kind = ControlKind.BUTTON,
+                mapping = androidxMidiMapping(MidiType.CC, 1, 20, 7),
+            )
+        )
+        val noteId = store.state.value.controls.first { it.mapping.type == MidiType.NOTE }.id
+        val ccId = store.state.value.controls.first { it.mapping.type == MidiType.CC }.id
+        val sentBefore = transport.sent.size
+
+        transport.emitIncoming(listOf(MidiMessage.noteOn(1, 60, 99)))
+        runCurrent()
+        assertEquals(99, store.state.value.controls.first { it.id == noteId }.value)
+
+        transport.emitIncoming(listOf(MidiMessage.noteOff(1, 60)))
+        runCurrent()
+        assertEquals(0, store.state.value.controls.first { it.id == noteId }.value)
+
+        transport.emitIncoming(listOf(MidiMessage.controlChange(1, 20, 64)))
+        runCurrent()
+        assertEquals(64, store.state.value.controls.first { it.id == ccId }.value)
+        assertEquals(sentBefore, transport.sent.size)
+    }
+
+    @Test
+    fun incomingFourteenBitPairUpdatesKnobAndIgnoresOrphanLsb() = runTest {
+        val transport = FakeTransport()
+        val store = ControllerStore(transport, InMemoryLayoutStore(), backgroundScope)
+        runCurrent()
+
+        store.upsertControl(
+            Control(
+                id = "",
+                label = "Cutoff",
+                kind = ControlKind.KNOB,
+                mapping = androidxMidiMapping(MidiType.CC, 1, 1, 14),
+            )
+        )
+        val id = store.state.value.controls.single().id
+
+        transport.emitIncoming(listOf(MidiMessage.controlChange(1, 33, 127)))
+        runCurrent()
+        assertEquals(0, store.state.value.controls.single().value)
+
+        transport.emitIncoming(
+            listOf(
+                MidiMessage.controlChange(1, 1, 64),
+                MidiMessage.controlChange(1, 33, 127),
+            )
+        )
+        runCurrent()
+        assertEquals(8319, store.state.value.controls.single().value)
+    }
+
+    @Test
     fun buttonCcSends127OnAndZeroOff() = runTest {
         val transport = FakeTransport()
         val store = ControllerStore(transport, InMemoryLayoutStore(), backgroundScope)
@@ -102,7 +172,7 @@ class ControllerStoreTest {
         assertEquals(0xB0, sent[0].status)
         assertEquals(1, sent[0].data1)
         assertEquals(70, sent[0].data2) // 9000 >> 7
-        assertEquals(2, sent[1].data1)
+        assertEquals(33, sent[1].data1)
         assertEquals(40, sent[1].data2) // 9000 & 0x7F
 
         store.setContinuousValue(id, 100)
@@ -255,6 +325,10 @@ private class FakeTransport : BleMidiTransport {
 
     suspend fun emit(event: TransportEvent) {
         events.emit(event)
+    }
+
+    suspend fun emitIncoming(messages: List<MidiMessage>) {
+        incoming.emit(messages)
     }
 }
 

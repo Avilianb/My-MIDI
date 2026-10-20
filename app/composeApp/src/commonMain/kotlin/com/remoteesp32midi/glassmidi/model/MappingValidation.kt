@@ -3,7 +3,7 @@ package com.remoteesp32midi.glassmidi.model
 /**
  * 控件映射校验规则：
  * - Button 允许 Note/CC，且只能是 7-bit；
- * - Knob/Fader 只能是 CC 14-bit，number 范围 0..126；
+ * - Knob/Fader 只能是 CC 14-bit，number 范围 0..31（LSB = number + 32）；
  * - 同一通道上，14-bit 的 MSB/LSB 不得与任何其他 CC 占用相同编号；
  * - 普通 7-bit CC 之间、Note 之间允许重复映射。
  */
@@ -37,7 +37,7 @@ fun validateControl(
             if (candidate.mapping.resolution != MidiResolution.FOURTEEN_BIT) {
                 return "Knob/Fader 必须是 14-bit CC"
             }
-            if (candidate.mapping.number !in 0..126) return "14-bit CC 编号必须在 0..126"
+            if (candidate.mapping.number !in 0..31) return "14-bit CC 编号必须在 0..31"
         }
     }
 
@@ -47,7 +47,7 @@ fun validateControl(
         candidate.mapping.type == MidiType.CC &&
             candidate.mapping.resolution == MidiResolution.FOURTEEN_BIT
     val candidateNumbers = if (candidateIsFourteenBit) {
-        setOf(candidate.mapping.number, candidate.mapping.number + 1)
+        setOf(candidate.mapping.number, candidate.mapping.number + 32)
     } else if (candidate.mapping.type == MidiType.CC && candidate.kind == ControlKind.BUTTON) {
         setOf(candidate.mapping.number)
     } else {
@@ -58,9 +58,9 @@ fun validateControl(
         if (other.mapping.type != MidiType.CC) continue
         if (other.mapping.channel != candidateChannel) continue
         if (other.kind == ControlKind.KNOB || other.kind == ControlKind.FADER) {
-            val occupied = setOf(other.mapping.number, other.mapping.number + 1)
+            val occupied = setOf(other.mapping.number, other.mapping.number + 32)
             if (candidateNumbers.any { it in occupied }) {
-                return "通道 ${candidateChannel} 的 CC ${other.mapping.number}/${other.mapping.number + 1} 已被「${other.label}」占用"
+                return "通道 ${candidateChannel} 的 CC ${other.mapping.number}/${other.mapping.number + 32} 已被「${other.label}」占用"
             }
         } else if (candidateIsFourteenBit && other.mapping.number in candidateNumbers) {
             return "通道 ${candidateChannel} 的 CC ${other.mapping.number} 已被「${other.label}」占用"

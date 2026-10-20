@@ -175,7 +175,7 @@ fun ControlEditor(
                                         number = if (draft.kind == ControlKind.BUTTON) {
                                             draft.mapping.number.coerceIn(0, 127)
                                         } else {
-                                            draft.mapping.number.coerceIn(0, 126)
+                                            draft.mapping.number.coerceIn(0, 31)
                                         },
                                     )
                                 )
@@ -210,7 +210,7 @@ fun ControlEditor(
 
                 FieldLabel(
                     if (draft.mapping.resolution == MidiResolution.FOURTEEN_BIT) {
-                        "CC MSB（LSB = MSB + 1）"
+                        "CC MSB（LSB = MSB + 32）"
                     } else if (draft.mapping.type == MidiType.NOTE) {
                         "Note 编号"
                     } else {
@@ -219,7 +219,7 @@ fun ControlEditor(
                 )
                 StepperRow(
                     label = if (draft.mapping.resolution == MidiResolution.FOURTEEN_BIT) {
-                        "CC ${draft.mapping.number} / ${draft.mapping.number + 1}"
+                        "CC ${draft.mapping.number} / ${draft.mapping.number + 32}"
                     } else {
                         "${draft.mapping.type.displayName} ${draft.mapping.number}"
                     },
@@ -229,7 +229,7 @@ fun ControlEditor(
                         )
                     },
                     onPlus = {
-                        val max = if (draft.mapping.resolution == MidiResolution.FOURTEEN_BIT) 126 else 127
+                        val max = if (draft.mapping.resolution == MidiResolution.FOURTEEN_BIT) 31 else 127
                         draft = draft.copy(
                             mapping = draft.mapping.copy(number = (draft.mapping.number + 1).coerceAtMost(max))
                         )
@@ -310,6 +310,6 @@ private fun MidiMapping.forKind(kind: ControlKind): MidiMapping = when (kind) {
     ControlKind.KNOB, ControlKind.FADER -> copy(
         type = MidiType.CC,
         resolution = MidiResolution.FOURTEEN_BIT,
-        number = if (type == MidiType.NOTE) 1 else number.coerceIn(0, 126),
+        number = if (type == MidiType.NOTE) 1 else number.coerceIn(0, 31),
     )
 }
