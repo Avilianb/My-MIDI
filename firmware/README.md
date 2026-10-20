@@ -238,7 +238,8 @@ USB->BLE sent=0 drop=0; unsupported=0 tx_drop=0 usb_unsupported=0 flushes=14 pan
   需要时再扩展（注意 BLE-MIDI 的 SysEx 分包与 USB 的 3 字节事件包不同）。
 - **没有 USB 状态 GATT**：手机 App 目前无法查询 USB 是否已挂载；只能通过 BLE 连接状态和
   数据是否被丢弃间接判断。
-- **没有 Android App**：本阶段只完成固件和调试工具验收；App 在下一阶段实现。
+- **Android App 在 `app/`**：连接、基础控件和布局持久化已实现，见 `app/README.md`；
+  USB→BLE 回传写入控件 UI 属于阶段 5。
 - **没有绑定/加密**：BLE 连接当前是开放外设，未启用 bonding；后续按 App 需求加。
 - **单连接**：`CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1`，只支持一个 BLE central。
 - **只处理 cable 0**：USB-MIDI 多 cable 尚未使用。

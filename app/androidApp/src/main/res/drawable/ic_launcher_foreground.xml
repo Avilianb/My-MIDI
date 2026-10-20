@@ -1,0 +1,22 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 三条推子轨道，中心区域避开自适应图标裁切 -->
+    <path
+        android:fillColor="#33FFFFFF"
+        android:pathData="M34,32h4v44h-4zM52,32h4v44h-4zM70,32h4v44h-4z" />
+    <path
+        android:fillColor="#4FD8E8"
+        android:pathData="M34,58h4v18h-4zM52,40h4v22h-4zM70,50h4v26h-4z" />
+    <path
+        android:fillColor="#EAFBFF"
+        android:pathData="M36,48m-6,0a6,6 0,1 0,12 0a6,6 0,1 0,-12 0" />
+    <path
+        android:fillColor="#EAFBFF"
+        android:pathData="M54,40m-6,0a6,6 0,1 0,12 0a6,6 0,1 0,-12 0" />
+    <path
+        android:fillColor="#B69CFF"
+        android:pathData="M72,50m-6,0a6,6 0,1 0,12 0a6,6 0,1 0,-12 0" />
+</vector>
