@@ -111,3 +111,11 @@ uint32_t usb_midi_write(const uint8_t *data, uint32_t len)
     }
     return tud_midi_stream_write(0, data, len);
 }
+
+uint32_t usb_midi_read_packets(uint8_t *packets, uint32_t max_packets)
+{
+    if (packets == NULL || max_packets == 0 || !tud_midi_mounted()) {
+        return 0;
+    }
+    return tud_midi_packet_read_n(packets, max_packets);
+}
