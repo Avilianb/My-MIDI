@@ -94,6 +94,7 @@ Create `.gitignore` at the repo root:
 
 ```gitignore
 firmware/build/
+firmware/managed_components/
 firmware/sdkconfig
 firmware/sdkconfig.old
 ```
