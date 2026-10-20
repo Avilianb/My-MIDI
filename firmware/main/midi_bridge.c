@@ -43,6 +43,8 @@ static volatile uint32_t s_ble_to_usb_dropped;
 static volatile uint32_t s_usb_unsupported;
 static volatile uint32_t s_usb_to_ble_sent;
 static volatile uint32_t s_usb_to_ble_dropped;
+static volatile uint32_t s_panic_failures;
+static volatile uint32_t s_queue_flushes;
 
 /** 把一条消息完整写入 USB；FIFO 满时最多重试 5 ms。 */
 static bool usb_write_all(const uint8_t *data, uint8_t len)
@@ -62,6 +64,38 @@ static bool usb_write_all(const uint8_t *data, uint8_t len)
         vTaskDelay(1);
     }
     return true;
+}
+
+/** 向 USB 发送 16 通道 All Notes Off / All Sound Off / Sustain Off。 */
+static void usb_send_panic(void)
+{
+    if (!usb_midi_device_mounted()) {
+        return;
+    }
+
+    for (uint8_t ch = 0; ch < 16; ch++) {
+        const uint8_t messages[3][3] = {
+            { (uint8_t)(0xB0 | ch), 123, 0 }, /* All Notes Off */
+            { (uint8_t)(0xB0 | ch), 120, 0 }, /* All Sound Off */
+            { (uint8_t)(0xB0 | ch), 64, 0 },  /* Sustain Off */
+        };
+        for (size_t i = 0; i < 3; i++) {
+            if (!usb_midi_device_mounted()) {
+                return;
+            }
+            if (!usb_write_all(messages[i], sizeof(messages[i]))) {
+                s_panic_failures++;
+            }
+        }
+    }
+}
+
+/** 丢弃断线/挂载边界上的旧消息，避免重连后重放。 */
+static void clear_queues(void)
+{
+    xQueueReset(s_ble_to_usb);
+    xQueueReset(s_usb_to_ble);
+    s_queue_flushes++;
 }
 
 /** USB-MIDI 4 字节事件包 → 完整 MIDI 消息；SysEx 首期不转发。 */
@@ -104,8 +138,44 @@ static void usb_task(void *arg)
 {
     (void)arg;
     int64_t next_log_us = esp_timer_get_time() + 5000000;
+    bool was_ready = false;
+    bool was_mounted = false;
 
     for (;;) {
+        const bool mounted = usb_midi_device_mounted();
+        const bool ready = ble_midi_link_ready();
+
+        /* BLE 断开/通知关闭：先清音，再丢弃旧队列。 */
+        if (was_ready && !ready) {
+            ESP_LOGW(TAG, "BLE ready -> false; panic");
+            usb_send_panic();
+            clear_queues();
+        }
+
+        /* USB 卸载：清掉不能在重枚举后重放的消息。 */
+        if (was_mounted && !mounted) {
+            ESP_LOGW(TAG, "USB unmounted; clearing queues");
+            clear_queues();
+        }
+
+        /* USB 新挂载：等主机枚举完成，再发一次 panic。 */
+        if (!was_mounted && mounted) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            if (usb_midi_device_mounted()) {
+                ESP_LOGI(TAG, "USB mounted; panic");
+                usb_send_panic();
+            }
+            clear_queues();
+        }
+
+        /* BLE 重新就绪：连接期间缓存的旧消息不能重放。 */
+        if (!was_ready && ready) {
+            clear_queues();
+        }
+
+        was_ready = ready;
+        was_mounted = mounted;
+
         midi_msg_t msg;
 
         /* BLE → USB：先排空，保证 Note Off 不被 USB OUT 读取拖住。 */
@@ -138,12 +208,15 @@ static void usb_task(void *arg)
         const int64_t now = esp_timer_get_time();
         if (now >= next_log_us) {
             ESP_LOGI(TAG,
-                     "BLE->USB sent=%lu drop=%lu; USB->BLE sent=%lu drop=%lu unsupported=%lu",
+                     "BLE->USB sent=%lu drop=%lu; USB->BLE sent=%lu drop=%lu unsupported=%lu; "
+                     "panic_fail=%lu flush=%lu",
                      (unsigned long)s_ble_to_usb_sent,
                      (unsigned long)(s_ble_to_usb_dropped + s_ble_rx_dropped),
                      (unsigned long)s_usb_to_ble_sent,
                      (unsigned long)s_usb_to_ble_dropped,
-                     (unsigned long)s_usb_unsupported);
+                     (unsigned long)s_usb_unsupported,
+                     (unsigned long)s_panic_failures,
+                     (unsigned long)s_queue_flushes);
             next_log_us = now + 5000000;
         }
 

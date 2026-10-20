@@ -1,4 +1,4 @@
-# Stage 2 USB-MIDI firmware
+# ESP32-S3 BLE-MIDI ↔ USB-MIDI firmware
 
 ## First-time setup (clean checkout)
 
@@ -28,16 +28,20 @@ Connect the ESP32-S3 **native USB** port (the `USB` port, not `UART`) to the com
 
 ## Expected MIDI
 
-- Channel 1
-- Note 60 (C4)
-- Velocity 100
-- Note On, then Note Off 500 ms later, repeating.
+上电后不再周期发送测试音。只有 BLE 写入 Note/CC 时，USB 才会出现对应消息。
 
-## Acceptance
+## Stage 3 behavior (in progress)
 
-1. Windows PnP shows a device with `VID_303A`.
-2. Ableton Live 12 lists `ESP32-S3 MIDI Bridge` as a MIDI input.
-3. A 10-second recording contains about 10 note-on and 10 note-off events.
-4. No note rings after stopping playback.
-5. Unplug/replug the native USB cable; notes resume.
-6. Run for 5 minutes; notes continue; a fresh 10-second recording still has about 10 note pairs.
+- 上电不再发送周期测试音；USB MIDI 只来自 BLE 写入。
+- BLE 名称 `ESP32-S3 MIDI`，标准 BLE-MIDI Service/Characteristic。
+- BLE 断开或 USB 新挂载时，向 16 个通道发送 CC 123（All Notes Off）、CC 120（All Sound Off）、CC 64=0（Sustain Off）。
+- 完整 nRF Connect/双向验收步骤在阶段 3 收尾时补齐。
+
+## Stage 3 acceptance
+
+1. Windows PnP still shows `VID_303A` / `PID_4008`.
+2. nRF Connect sees `ESP32-S3 MIDI`, the BLE-MIDI service, and enables notify.
+3. BLE Note/CC and 14-bit CC pairs arrive on the USB MIDI port.
+4. USB MIDI CC arrives as a BLE notification; disabling notify drops messages without crashing.
+5. BLE disconnect during a held Note On sends CC 123/120/64; reconnect works.
+6. Full packet table and latency acceptance are filled in at stage 3 closeout.
