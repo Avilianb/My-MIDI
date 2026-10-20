@@ -343,7 +343,7 @@ void midi_bridge_on_ble_midi(const uint8_t *msg, uint8_t len, int64_t rx_time_us
 
 `firmware/main/midi_bridge.c`:
 
-- `midi_msg_t { uint8_t len; uint8_t data[3]; int64_t ts_us; }`.
+- `midi_msg_t { uint8_t len; uint8_t data[3]; int64_t rx_time_us; }`.
 - `QueueHandle_t s_ble_to_usb` depth 256.
 - `midi_bridge_init()` creates the queue; returns `ESP_ERR_NO_MEM` on failure.
 - `midi_bridge_on_ble_midi()` rejects NULL, `len < 1`, `len > 3`; copies into a local `midi_msg_t`; `xQueueSend(s_ble_to_usb, &msg, pdMS_TO_TICKS(5))`. This is deliberate backpressure on overflow, not an unbounded block. If it still times out, increment `s_ble_rx_dropped`; acceptance must show zero drops at 100 Hz.
@@ -439,7 +439,7 @@ In `usb_midi_device.h`:
 uint32_t usb_midi_read_packets(uint8_t *packets, uint32_t max_packets);
 ```
 
-In `usb_midi_device.c`, return `tud_midi_packet_read_n(0, packets, max_packets)`.
+In `usb_midi_device.c`, return `tud_midi_packet_read_n(packets, max_packets)`. In the installed TinyUSB 0.21.0~2 single-interface wrapper, this function has no `itf` parameter; the multi-interface variant is `tud_midi_n_packet_read_n(itf, ...)`.
 
 - [ ] **Step 3: Add USB → BLE queue and task**
 
