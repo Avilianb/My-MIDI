@@ -18,6 +18,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.SystemClock
+import android.util.Log
 import com.remoteesp32midi.glassmidi.midi.BleMidiCodec
 import com.remoteesp32midi.glassmidi.model.MidiMessage
 import java.util.UUID
@@ -122,7 +123,12 @@ class AndroidBleMidiTransport(
         }
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            // 固件用 BLE 5 扩展广播（UUID+名称超过 31 字节）。Android 默认
+            // legacy=true，只回传传统广播，因此这里必须显式接收扩展广播。
+            .setLegacy(false)
+            .setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
             .build()
+        Log.d(TAG, "startScan legacy=false phy=ALL")
         try {
             scanner.startScan(null, settings, scanCallback)
         } catch (error: SecurityException) {
@@ -208,6 +214,7 @@ class AndroidBleMidiTransport(
             } == true
             val name = record?.deviceName
                 ?: runCatching { result.device.name }.getOrNull()
+            Log.d(TAG, "scan result ${result.device.address} name=$name uuid=$advertisedUuid")
             if (!advertisedUuid && name?.contains("ESP32-S3 MIDI") != true) return
             val device = BleDevice(
                 name = name ?: "ESP32-S3 MIDI",
@@ -221,6 +228,7 @@ class AndroidBleMidiTransport(
         }
 
         override fun onScanFailed(errorCode: Int) {
+            Log.w(TAG, "scan failed code=$errorCode")
             publishError("BLE 扫描失败，code=$errorCode")
             emitConnection(BleConnection(phase = ConnectionPhase.IDLE))
         }
@@ -229,6 +237,7 @@ class AndroidBleMidiTransport(
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            Log.d(TAG, "conn state status=$status newState=$newState address=${gatt.device.address}")
             if (gatt !== this@AndroidBleMidiTransport.gatt) {
                 gatt.close()
                 return
@@ -267,6 +276,7 @@ class AndroidBleMidiTransport(
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (gatt !== this@AndroidBleMidiTransport.gatt) return
             if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.w(TAG, "service discovery failed status=$status")
                 publishError("BLE 服务发现失败，code=$status")
                 gatt.disconnect()
                 return
@@ -316,6 +326,7 @@ class AndroidBleMidiTransport(
             if (gatt !== this@AndroidBleMidiTransport.gatt) return
             if (descriptor.uuid != CCCD_UUID) return
             if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.w(TAG, "descriptor write failed status=$status")
                 publishError("订阅 BLE 通知失败，code=$status")
                 gatt.disconnect()
                 return
@@ -323,6 +334,7 @@ class AndroidBleMidiTransport(
             requestHighPriority(gatt)
             retryAttempt = 0
             clearSendQueue()
+            Log.i(TAG, "BLE-MIDI READY ${gatt.device.address}")
             emitConnection(
                 BleConnection(
                     phase = ConnectionPhase.READY,
@@ -467,6 +479,7 @@ class AndroidBleMidiTransport(
     }
 
     private fun publishError(message: String) {
+        Log.w(TAG, "error: $message")
         _events.tryEmit(TransportEvent.Error(message))
     }
 
@@ -489,6 +502,7 @@ class AndroidBleMidiTransport(
             PackageManager.PERMISSION_GRANTED
 
     companion object {
+        private const val TAG = "GlassMidiBle"
         val SERVICE_UUID: UUID = UUID.fromString("03B80E5A-EDE8-4B33-A751-6CE34EC4C700")
         val CHARACTERISTIC_UUID: UUID = UUID.fromString("7772E5DB-3868-4112-A1A9-F2669D106BF3")
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805F9B34FB")

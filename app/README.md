@@ -93,6 +93,9 @@ App 严格使用标准 BLE-MIDI：
 - Service：`03b80e5a-ede8-4b33-a751-6ce34ec4c700`
 - Characteristic：`7772e5db-3868-4112-a1a9-f2669d106bf3`
 - 写：`Write Without Response`；读回：CCCD Notify。
+- 固件使用 **BLE 5 extended advertising**（128-bit UUID + 名称超过 31 字节）；App 的
+  `ScanSettings` 显式设置 `setLegacy(false)` + `PHY_LE_ALL_SUPPORTED`。不要改回只扫描
+  legacy 广播，否则会表现为“系统蓝牙能看到、App 扫描不到”。
 - 每个通知/写入由 `80 <timestamp>` 头开始，后接原始 MIDI 字节。编码器在同一个写入包内
   携带一条消息；14-bit 旋钮/推子把 MSB、LSB 两条 CC 放在同一个包里，顺序固定为
   MSB→LSB，保证固件能用同一时间戳配对。
@@ -149,6 +152,17 @@ App 严格使用标准 BLE-MIDI：
 | DAW 收到手机操作对应通道数据 | 代码路径完成；待真机 + USB MIDI 监视器确认 |
 | 旋钮连续转动流畅、不丢包 | 10 ms 合并节流 + 单写队列 + 松手强制最终值；待真机手感/丢包验收 |
 | 断开重连后功能正常 | 自动退避重连、Ready 重发连续值、Button 清零；待真机验收 |
+
+### 扫描不到设备
+
+1. ESP32-S3 同一时间只允许一个 BLE central。先断开系统蓝牙、nRF Connect、LightBlue
+   等所有已连接客户端，再给 ESP 断电重启。
+2. Android 11 及以下，App 扫描还要求系统定位服务开启；Android 12+ 只需附近设备权限。
+3. 固件广播是 BLE 5 extended advertising；确认手机支持 BLE 5，且安装的是包含
+   `setLegacy(false)` 修复的 APK（本仓库当前版本）。
+4. 系统蓝牙里能看到设备但 App 扫描不到时，用 nRF Connect 对照：
+   - nRF Connect 也看不到：ESP 没有广播，通常是被其他 central 占用或未上电。
+   - nRF Connect 能看到、App 看不到：抓 `adb logcat`，过滤 `GlassMidiBle` 后反馈。
 
 ## 已知限制（阶段 5 处理）
 
