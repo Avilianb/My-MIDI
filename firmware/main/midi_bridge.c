@@ -27,6 +27,8 @@ static const char *TAG = "midi_bridge";
 #define MIDI_BATCH_MAX 8
 #define USB_READ_BATCH 16
 #define USB_WRITE_RETRY_US 5000
+#define LAT_BUCKET_US 100
+#define LAT_BUCKET_COUNT 64
 
 typedef struct {
     uint8_t len;
@@ -46,6 +48,11 @@ static volatile uint32_t s_usb_to_ble_dropped;
 static volatile uint32_t s_panic_failures;
 static volatile uint32_t s_queue_flushes;
 
+/* 只在 usb_task 中更新/读取，无需加锁。 */
+static uint32_t s_lat_hist[LAT_BUCKET_COUNT];
+static uint32_t s_lat_count;
+static uint32_t s_lat_max_us;
+
 /** 把一条消息完整写入 USB；FIFO 满时最多重试 5 ms。 */
 static bool usb_write_all(const uint8_t *data, uint8_t len)
 {
@@ -64,6 +71,45 @@ static bool usb_write_all(const uint8_t *data, uint8_t len)
         vTaskDelay(1);
     }
     return true;
+}
+
+/** 记录 BLE 回调入队到 USB 写完的延迟。 */
+static void latency_record(int64_t rx_time_us)
+{
+    int64_t latency = esp_timer_get_time() - rx_time_us;
+    if (latency < 0) {
+        latency = 0;
+    }
+
+    const uint32_t us = (uint32_t)latency;
+    uint32_t bucket = us / LAT_BUCKET_US;
+    if (bucket >= LAT_BUCKET_COUNT) {
+        bucket = LAT_BUCKET_COUNT - 1;
+    }
+
+    s_lat_hist[bucket]++;
+    s_lat_count++;
+    if (us > s_lat_max_us) {
+        s_lat_max_us = us;
+    }
+}
+
+/** 返回百分位所在桶的下界；最高桶报告 6300 µs。 */
+static uint32_t latency_percentile(uint32_t percent)
+{
+    if (s_lat_count == 0) {
+        return 0;
+    }
+
+    const uint64_t target = ((uint64_t)s_lat_count * percent + 99) / 100;
+    uint64_t cumulative = 0;
+    for (uint32_t i = 0; i < LAT_BUCKET_COUNT; i++) {
+        cumulative += s_lat_hist[i];
+        if (cumulative >= target) {
+            return i == (LAT_BUCKET_COUNT - 1) ? 6300 : i * LAT_BUCKET_US;
+        }
+    }
+    return 6300;
 }
 
 /** 向 USB 发送 16 通道 All Notes Off / All Sound Off / Sustain Off。 */
@@ -186,6 +232,7 @@ static void usb_task(void *arg)
             }
             if (usb_write_all(msg.data, msg.len)) {
                 s_ble_to_usb_sent++;
+                latency_record(msg.rx_time_us);
             } else {
                 s_ble_to_usb_dropped++;
             }
@@ -207,16 +254,25 @@ static void usb_task(void *arg)
 
         const int64_t now = esp_timer_get_time();
         if (now >= next_log_us) {
+            ble_midi_link_stats_t link_stats;
+            ble_midi_link_get_stats(&link_stats);
+
             ESP_LOGI(TAG,
-                     "BLE->USB sent=%lu drop=%lu; USB->BLE sent=%lu drop=%lu unsupported=%lu; "
-                     "panic_fail=%lu flush=%lu",
+                     "BRIDGE stats: BLE->USB sent=%lu drop=%lu p50=%luus p95=%luus max=%luus; "
+                     "USB->BLE sent=%lu drop=%lu; unsupported=%lu tx_drop=%lu usb_unsupported=%lu "
+                     "flushes=%lu panic_fail=%lu",
                      (unsigned long)s_ble_to_usb_sent,
                      (unsigned long)(s_ble_to_usb_dropped + s_ble_rx_dropped),
+                     (unsigned long)latency_percentile(50),
+                     (unsigned long)latency_percentile(95),
+                     (unsigned long)s_lat_max_us,
                      (unsigned long)s_usb_to_ble_sent,
                      (unsigned long)s_usb_to_ble_dropped,
+                     (unsigned long)link_stats.rx_unsupported,
+                     (unsigned long)link_stats.tx_dropped,
                      (unsigned long)s_usb_unsupported,
-                     (unsigned long)s_panic_failures,
-                     (unsigned long)s_queue_flushes);
+                     (unsigned long)s_queue_flushes,
+                     (unsigned long)s_panic_failures);
             next_log_us = now + 5000000;
         }
 
