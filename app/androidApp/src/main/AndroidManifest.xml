@@ -29,7 +29,7 @@
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
-        android:label="Glass MIDI"
+        android:label="My MIDI"
         android:supportsRtl="true"
         android:theme="@style/Theme.GlassMidi">
         <activity

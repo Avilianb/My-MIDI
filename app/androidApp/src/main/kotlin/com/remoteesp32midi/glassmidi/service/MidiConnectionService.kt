@@ -102,13 +102,13 @@ class MidiConnectionService : Service() {
             ConnectionPhase.READY -> "已连接" to (connection.deviceName ?: "ESP32-S3 MIDI")
             ConnectionPhase.CONNECTING -> "正在连接" to (connection.deviceName ?: "ESP32-S3 MIDI")
             ConnectionPhase.RECONNECTING -> "等待重连" to (connection.deviceName ?: "ESP32-S3 MIDI")
-            ConnectionPhase.SCANNING -> "正在扫描" to "Glass MIDI"
+            ConnectionPhase.SCANNING -> "正在扫描" to "My MIDI"
             ConnectionPhase.ERROR -> "连接异常" to (connection.detail ?: "请回到 App 检查")
-            ConnectionPhase.IDLE -> "等待连接" to "打开 Glass MIDI 选择设备"
+            ConnectionPhase.IDLE -> "等待连接" to "打开 My MIDI 选择设备"
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentTitle("Glass MIDI · $title")
+            .setContentTitle("My MIDI · $title")
             .setContentText(text)
             .setContentIntent(openAppIntent)
             .setOngoing(true)
