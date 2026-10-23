@@ -21,21 +21,16 @@ Windows / macOS / Linux + DAW
 ## 工具链与依赖
 
 - ESP-IDF **v5.5.2**（ESP32-S3 target）。
-- 组件版本（`firmware/dependencies.lock` 锁定）：
-  - `espressif/esp_tinyusb` 2.4.0
+- 组件版本（`firmware/main/idf_component.yml`）：
+  - `espressif/esp_tinyusb` ^2.0.0（锁定 2.4.0）
   - `espressif/tinyusb` 0.21.0~2
-  - `espressif/ble_midi` 0.1.0~2
-  - `espressif/ble_conn_mgr` 1.3.1
-  - `espressif/ble_services` 1.5.0
-  - `espressif/cmake_utilities` 0.5.3
+  - ESP-IDF 内置 `bt`（原生 NimBLE Host/GAP/GATT）
 - `firmware/sdkconfig.defaults` 关键配置：
   - `CONFIG_TINYUSB_MIDI_COUNT=1`
   - `CONFIG_FREERTOS_HZ=1000`（1 ms tick；默认 100 Hz 会让桥接任务多出约 10 ms 延迟）
-  - `CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1`
-  - `CONFIG_BLE_CONN_MGR_ROLE_PERIPHERAL=y`
-  - `CONFIG_BLE_MIDI_PROFILE=y`
-  - `CONFIG_BLE_CONN_MGR_EXTENDED_ADV=y`
-
+  - `CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2`（支持 2 台手机同时连接）
+  - `CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y`
+  - `CONFIG_BT_NIMBLE_EXT_ADV=y`
 ## 首次构建（干净 checkout）
 
 在 PowerShell 中执行，不要用 Git Bash（ESP-IDF 的 batch/export 脚本会拒绝 `MSYSTEM`）。
@@ -73,11 +68,9 @@ idf.py -C firmware -p COM5 flash monitor
 - Product: `ESP32-S3 MIDI Bridge`
 - Serial: `ESP32S3-MIDI-01`
 - VID/PID: `0x303A / 0x4008`
-- 1 个 MIDI interface、1 个 IN endpoint、1 个 OUT endpoint
+- 1 个 MIDI Streaming interface、2 根虚拟线缆（Virtual Cable 0: `ESP32-S3 MIDI 1`、Virtual Cable 1: `ESP32-S3 MIDI 2`）
 
-Windows 设备管理器应在 `声音、视频和游戏控制器` 或 `音频设备` 中出现 MIDI 端口；
-本机测试时 mido 枚举到的端口名为 `ESP32-S3 MIDI Bridge 2`（输入）和
-`ESP32-S3 MIDI Bridge 3`（输出）；Ableton 中选择 `ESP32-S3 MIDI Bridge` 的 Track/Remote 即可。
+Windows / macOS 的 DAW（如 Ableton Live）会识别到 2 个独立的 MIDI 输入/输出端口（Port 1 与 Port 2），分别对应乐手 1 与乐手 2，各自拥有独立的 16 个 MIDI Channel。
 
 ## BLE 接口
 
@@ -232,19 +225,20 @@ USB->BLE sent=0 drop=0; unsupported=0 tx_drop=0 usb_unsupported=0 flushes=14 pan
 | 5 分钟持续会话 | 2921 个 Note On/Off 周期 + 292 条 CC（约 6134 条），连接保持 300 s，`drop=0`，`p95=600us`，`max=1552us` |
 | USB 物理拔插 | 需要人工拔插验收；挂载清音路径已在启动日志验证 |
 
+## 双手机连接、端口握手与防卡音机制
+
+- **单广播实例 + 双连接**：已连接手机数 `< 2` 时自动开启广播，连满 2 台手机后自动停止广播（演出期间 0 广播射频开销）；任一台断开后自动恢复广播。
+- **端口握手与回执（`[0xF4, 0x7D, payload]`）**：
+  - `bit 0`：目标端口（`0` = Port 1 / Cable 0，`1` = Port 2 / Cable 1）。
+  - `bit 4`：`0` 表示连接/重连时的自动握手（若目标端口已被另一台正在演出的手机显式占用，固件拒绝抢占并分配空闲端口）；`1` 表示用户在 App 内手动点击切换端口（强制互换）。
+  - 每次绑定或变更端口后，固件通过 BLE-MIDI Notify 向手机下发 `[0xF4, 0x7D, actual_cable]` 回执，App 自动同步显示真实分配到的端口。
+- **活跃音符跟踪与 Note Off 补发**：`midi_bridge` 维护每个端口 16 通道 × 128 音符的活跃位图与挂起 Note Off 位图；即使队列或 USB FIFO 瞬时满载，Note Off 也绝不丢失，并在下一循环最优先补发；断连清音时除发送 CC 123/120/64 外，还会逐音补发所有未释放音符的 Note Off。
+
 ## 已知限制
 
-- **不转发 SysEx**：BLE 侧解析器拒绝/忽略 SysEx；USB OUT 的 CIN `0x04..0x07` 也会被丢弃。
-  需要时再扩展（注意 BLE-MIDI 的 SysEx 分包与 USB 的 3 字节事件包不同）。
-- **没有 USB 状态 GATT**：手机 App 目前无法查询 USB 是否已挂载；只能通过 BLE 连接状态和
-  数据是否被丢弃间接判断。
-- **Android App 在 `app/`**：连接、基础控件和布局持久化已实现，见 `app/README.md`；
-  USB→BLE 回传写入控件 UI 属于阶段 5。
-- **没有绑定/加密**：BLE 连接当前是开放外设，未启用 bonding；后续按 App 需求加。
-- **单连接**：`CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1`，只支持一个 BLE central。
-- **只处理 cable 0**：USB-MIDI 多 cable 尚未使用。
-- **没有持久化配置**：通道、控件布局等由后续 App 负责。
-- BLE-MIDI 时间戳仅用于协议封装，未做主机时钟同步；当前控制消息不依赖精确时间戳。
+- **不转发普通 SysEx**：除端口握手包外，普通长 SysEx 不转发到 USB。
+- **没有绑定/加密**：BLE 连接当前是开放外设，未启用 bonding。
+- **最多同时连接 2 台手机**：`BLE_MIDI_MAX_PORTS = 2`。
 
 ## 故障排查
 

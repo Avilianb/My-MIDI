@@ -16,6 +16,7 @@ import androidx.core.content.ContextCompat
 import com.remoteesp32midi.glassmidi.GlassMidiApplication
 import com.remoteesp32midi.glassmidi.MainActivity
 import com.remoteesp32midi.glassmidi.ble.BleConnection
+import com.remoteesp32midi.glassmidi.ble.BleDevice
 import com.remoteesp32midi.glassmidi.ble.ConnectionPhase
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -24,6 +25,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
@@ -72,7 +74,23 @@ class MidiConnectionService : Service() {
             return START_NOT_STICKY
         }
         startForeground()
-        return START_NOT_STICKY
+        // F-11：若进程被系统回收后由 START_STICKY 重建服务（intent == null），自动恢复上次连接的设备。
+        if (intent == null) {
+            scope.launch {
+                val state = container.store.state.first { it.loaded }
+                val address = state.lastDeviceAddress
+                if (address != null && state.connection.phase == ConnectionPhase.IDLE) {
+                    container.store.connect(
+                        BleDevice(
+                            name = state.lastDeviceName ?: "ESP32-S3 MIDI",
+                            address = address,
+                            rssi = 0,
+                        )
+                    )
+                }
+            }
+        }
+        return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

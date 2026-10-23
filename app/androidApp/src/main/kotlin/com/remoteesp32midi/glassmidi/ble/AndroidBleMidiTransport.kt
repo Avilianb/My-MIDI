@@ -66,7 +66,15 @@ class AndroidBleMidiTransport(
     )
     override val incoming: Flow<List<MidiMessage>> = _incoming.asSharedFlow()
 
-    private val sendQueue = Channel<ByteArray>(capacity = 256)
+    // F-06：高优先级通道（Note On/Off、端口握手）与连续控制通道分离，
+    // 确保多指快速拖动推子时按下的 Note 绝不会被排在几十帧 CC 后面；
+    // 连续通道使用 DROP_OLDEST，极端拥塞时自动淘汰过期的中间推子帧。
+    private val prioritySendQueue = Channel<ByteArray>(capacity = 64)
+    private val continuousSendQueue = Channel<ByteArray>(
+        capacity = 128,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
+    )
+    private val sendSignal = Channel<Unit>(capacity = Channel.CONFLATED)
     private val writeMutex = Mutex()
     @OptIn(ExperimentalCoroutinesApi::class)
     private val writeDispatcher = Dispatchers.IO.limitedParallelism(1)
@@ -74,6 +82,7 @@ class AndroidBleMidiTransport(
     private var scanTimeoutJob: Job? = null
     private var scanPublishJob: Job? = null
     @Volatile private var scanDevicesDirty = false
+    private var connectTimeoutJob: Job? = null
     private var reconnectJob: Job? = null
     @Volatile private var gatt: BluetoothGatt? = null
     @Volatile private var midiCharacteristic: BluetoothGattCharacteristic? = null
@@ -84,10 +93,15 @@ class AndroidBleMidiTransport(
 
     init {
         scope.launch(writeDispatcher) {
-            for (packet in sendQueue) {
-                writePacket(packet)
-                // Android 的 GATT 操作一次只能有一个；留出连接间隔给协议栈。
-                delay(WRITE_PACING_MS)
+            for (signal in sendSignal) {
+                while (true) {
+                    val packet = prioritySendQueue.tryReceive().getOrNull()
+                        ?: continuousSendQueue.tryReceive().getOrNull()
+                        ?: break
+                    writePacket(packet)
+                    // Android 的 GATT 操作一次只能有一个；留出连接间隔给协议栈。
+                    delay(WRITE_PACING_MS)
+                }
             }
         }
     }
@@ -97,9 +111,17 @@ class AndroidBleMidiTransport(
         // 未 Ready 时不排队：旧按键/旋钮值在重连后重放会造成卡音或状态跳变。
         if (lastConnection.phase != ConnectionPhase.READY) return
         val packet = codec.encode(messages, SystemClock.elapsedRealtime())
-        if (!sendQueue.trySend(packet).isSuccess) {
-            _events.tryEmit(TransportEvent.Error("BLE 发送队列已满，已丢弃一帧"))
+        val isPriority = messages.any {
+            it.command == 0x80 || it.command == 0x90 || it.isPortHandshake
         }
+        if (isPriority) {
+            if (!prioritySendQueue.trySend(packet).isSuccess) {
+                _events.tryEmit(TransportEvent.Error("BLE 优先发送队列已满"))
+            }
+        } else {
+            continuousSendQueue.trySend(packet)
+        }
+        sendSignal.trySend(Unit)
     }
 
     @SuppressLint("MissingPermission")
@@ -225,10 +247,23 @@ class AndroidBleMidiTransport(
                 deviceName = safeDeviceName(device),
             )
         )
+        startConnectWatchdog(address)
         gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             device.connectGatt(context, autoConnect, gattCallback, BluetoothDevice.TRANSPORT_LE)
         } else {
             device.connectGatt(context, autoConnect, gattCallback)
+        }
+    }
+
+    private fun startConnectWatchdog(address: String) {
+        connectTimeoutJob?.cancel()
+        connectTimeoutJob = scope.launch {
+            delay(CONNECT_TIMEOUT_MS)
+            if (lastConnection.phase != ConnectionPhase.READY && !manualDisconnect) {
+                Log.w(TAG, "connect watchdog timeout for $address; scheduling reconnect")
+                closeGatt()
+                scheduleReconnect()
+            }
         }
     }
 
@@ -358,6 +393,8 @@ class AndroidBleMidiTransport(
                 gatt.disconnect()
                 return
             }
+            connectTimeoutJob?.cancel()
+            connectTimeoutJob = null
             requestHighPriority(gatt)
             retryAttempt = 0
             clearSendQueue()
@@ -484,6 +521,8 @@ class AndroidBleMidiTransport(
 
     @SuppressLint("MissingPermission")
     private fun closeGatt() {
+        connectTimeoutJob?.cancel()
+        connectTimeoutJob = null
         clearSendQueue()
         val current = gatt
         gatt = null
@@ -495,7 +534,10 @@ class AndroidBleMidiTransport(
     }
 
     private fun clearSendQueue() {
-        while (sendQueue.tryReceive().isSuccess) {
+        while (prioritySendQueue.tryReceive().isSuccess) {
+            // 清空断线前排队的旧状态。
+        }
+        while (continuousSendQueue.tryReceive().isSuccess) {
             // 清空断线前排队的旧状态。
         }
     }
@@ -542,6 +584,7 @@ class AndroidBleMidiTransport(
 
         private const val MTU_REQUEST = 247
         private const val SCAN_TIMEOUT_MS = 10_000L
+        private const val CONNECT_TIMEOUT_MS = 10_000L
         private const val DEVICE_PUBLISH_INTERVAL_MS = 250L
         private const val WRITE_PACING_MS = 3L
         private const val WRITE_RETRY_DELAY_MS = 4L

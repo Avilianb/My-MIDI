@@ -24,7 +24,6 @@ typedef struct {
 
 esp_err_t ble_midi_link_init(ble_midi_rx_cb_t cb);
 esp_err_t ble_midi_link_start(void);
-bool ble_midi_link_ready(void);
 bool ble_midi_link_port_ready(uint8_t cable_num);
 
 /** 向指定 cable_num (0..1) 绑定的手机发送最多 8 条完整 MIDI 消息；每条 1..3 字节。 */

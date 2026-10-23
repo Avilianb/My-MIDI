@@ -56,6 +56,7 @@ typedef struct {
 } ble_midi_slot_t;
 
 static ble_midi_slot_t s_slots[BLE_MIDI_MAX_PORTS];
+static portMUX_TYPE s_slots_lock = portMUX_INITIALIZER_UNLOCKED;
 static ble_midi_rx_cb_t s_rx_cb;
 static uint16_t s_midi_chr_val_handle;
 static uint8_t s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
@@ -69,7 +70,7 @@ static volatile uint32_t s_tx_dropped;
 static int ble_midi_gap_event(struct ble_gap_event *event, void *arg);
 static void start_advertising_if_needed(void);
 
-static int connected_slot_count(void)
+static int connected_slot_count_locked(void)
 {
     int count = 0;
     for (int i = 0; i < BLE_MIDI_MAX_PORTS; i++) {
@@ -80,7 +81,15 @@ static int connected_slot_count(void)
     return count;
 }
 
-static int find_slot_by_conn_handle(uint16_t conn_handle)
+static int connected_slot_count(void)
+{
+    portENTER_CRITICAL(&s_slots_lock);
+    const int count = connected_slot_count_locked();
+    portEXIT_CRITICAL(&s_slots_lock);
+    return count;
+}
+
+static int find_slot_by_conn_handle_locked(uint16_t conn_handle)
 {
     for (int i = 0; i < BLE_MIDI_MAX_PORTS; i++) {
         if (s_slots[i].connected && s_slots[i].conn_handle == conn_handle) {
@@ -90,17 +99,7 @@ static int find_slot_by_conn_handle(uint16_t conn_handle)
     return -1;
 }
 
-static int find_slot_by_cable(uint8_t cable_num)
-{
-    for (int i = 0; i < BLE_MIDI_MAX_PORTS; i++) {
-        if (s_slots[i].connected && s_slots[i].cable_num == cable_num) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-static uint8_t allocate_default_cable(int self_slot)
+static uint8_t allocate_default_cable_locked(int self_slot)
 {
     for (uint8_t cable = 0; cable < BLE_MIDI_MAX_PORTS; cable++) {
         bool used = false;
@@ -117,31 +116,92 @@ static uint8_t allocate_default_cable(int self_slot)
     return (uint8_t)(self_slot % BLE_MIDI_MAX_PORTS);
 }
 
-static void bind_slot_to_cable(int slot_idx, uint8_t desired_cable)
+/** 向指定连接下发端口绑定回执 [0xF4, 0x7D, actual_cable]，让手机 UI 同步真实分配到的端口。 */
+static void notify_port_assignment(uint16_t conn_handle, uint8_t cable_num)
+{
+    const uint16_t ts13 = (uint16_t)((xTaskGetTickCount() * portTICK_PERIOD_MS) & 0x1FFF);
+    const uint8_t pkt[5] = {
+        (uint8_t)(0x80 | ((ts13 >> 7) & 0x3F)),
+        (uint8_t)(0x80 | (ts13 & 0x7F)),
+        0xF4,
+        0x7D,
+        (uint8_t)(cable_num & 0x01),
+    };
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(pkt, sizeof(pkt));
+    if (om != NULL) {
+        (void)ble_gatts_notify_custom(conn_handle, s_midi_chr_val_handle, om);
+    }
+}
+
+static void bind_slot_to_cable(int slot_idx, uint8_t desired_cable, bool force_claim)
 {
     if (slot_idx < 0 || slot_idx >= BLE_MIDI_MAX_PORTS || desired_cable >= BLE_MIDI_MAX_PORTS) {
         return;
     }
 
-    s_slots[slot_idx].explicit_claim = true;
-    if (s_slots[slot_idx].cable_num == desired_cable) {
-        ESP_LOGI(TAG, "slot=%d handle=%u confirmed USB Port %u (cable=%u)",
-                 slot_idx, s_slots[slot_idx].conn_handle, desired_cable + 1, desired_cable);
+    uint16_t self_handle = 0;
+    uint8_t self_cable = 0;
+    bool self_notify = false;
+    uint16_t other_handle = 0;
+    uint8_t other_cable = 0;
+    bool other_notify = false;
+    bool rejected = false;
+
+    portENTER_CRITICAL(&s_slots_lock);
+    if (!s_slots[slot_idx].connected) {
+        portEXIT_CRITICAL(&s_slots_lock);
         return;
     }
 
-    const uint8_t previous_cable = s_slots[slot_idx].cable_num;
+    int other_idx = -1;
     for (int i = 0; i < BLE_MIDI_MAX_PORTS; i++) {
         if (i != slot_idx && s_slots[i].connected && s_slots[i].cable_num == desired_cable) {
-            /* 若另一台手机仅默认分配了该端口（或用户在当前手机主动切换端口），将另一台移到备用端口 */
-            s_slots[i].cable_num = previous_cable;
-            ESP_LOGI(TAG, "slot=%d handle=%u reassigned to USB Port %u (cable=%u)",
-                     i, s_slots[i].conn_handle, previous_cable + 1, previous_cable);
+            other_idx = i;
+            break;
         }
     }
-    s_slots[slot_idx].cable_num = desired_cable;
-    ESP_LOGI(TAG, "slot=%d handle=%u bound to USB Port %u (cable=%u)",
-             slot_idx, s_slots[slot_idx].conn_handle, desired_cable + 1, desired_cable);
+
+    if (other_idx >= 0 && !force_claim && s_slots[other_idx].explicit_claim) {
+        /*
+         * F-02 / F-03 防护：目标端口已被另一台正在演出的手机显式认领，
+         * 且本次仅是连接/重连时的自动握手（!force_claim），拒绝抢占并分配空闲端口。
+         */
+        s_slots[slot_idx].cable_num = allocate_default_cable_locked(slot_idx);
+        s_slots[slot_idx].explicit_claim = true;
+        rejected = true;
+    } else {
+        const uint8_t fallback_cable = (uint8_t)((desired_cable + 1) % BLE_MIDI_MAX_PORTS);
+        if (other_idx >= 0) {
+            s_slots[other_idx].cable_num = fallback_cable;
+            other_handle = s_slots[other_idx].conn_handle;
+            other_cable = fallback_cable;
+            other_notify = s_slots[other_idx].notify_enabled;
+        }
+        s_slots[slot_idx].cable_num = desired_cable;
+        s_slots[slot_idx].explicit_claim = true;
+    }
+
+    self_handle = s_slots[slot_idx].conn_handle;
+    self_cable = s_slots[slot_idx].cable_num;
+    self_notify = s_slots[slot_idx].notify_enabled;
+    portEXIT_CRITICAL(&s_slots_lock);
+
+    if (rejected) {
+        ESP_LOGW(TAG, "slot=%d handle=%u auto-claim Port %u rejected (in use); assigned Port %u",
+                 slot_idx, self_handle, desired_cable + 1, self_cable + 1);
+    } else {
+        ESP_LOGI(TAG, "slot=%d handle=%u bound to USB Port %u (cable=%u, force=%d)",
+                 slot_idx, self_handle, self_cable + 1, self_cable, (int)force_claim);
+    }
+
+    if (self_notify) {
+        notify_port_assignment(self_handle, self_cable);
+    }
+    if (other_notify) {
+        ESP_LOGI(TAG, " handle=%u reassigned to USB Port %u (cable=%u)",
+                 other_handle, other_cable + 1, other_cable);
+        notify_port_assignment(other_handle, other_cable);
+    }
 }
 
 static void dispatch_ble_midi_message(int slot_idx, const uint8_t *msg, uint16_t msg_len)
@@ -150,9 +210,15 @@ static void dispatch_ble_midi_message(int slot_idx, const uint8_t *msg, uint16_t
         return;
     }
 
-    /* App 端口身份握手包：[0xF4, 0x7D, 0x00|0x01]，拦截并绑定 USB Cable，不转发到电脑 */
-    if (msg_len == 3 && msg[0] == 0xF4 && msg[1] == 0x7D && msg[2] < BLE_MIDI_MAX_PORTS) {
-        bind_slot_to_cable(slot_idx, msg[2]);
+    /*
+     * App 端口身份握手包：[0xF4, 0x7D, payload]
+     * bit 0: desired_cable (0 = Port 1, 1 = Port 2)
+     * bit 4: force_claim (0 = 连接自动握手，不抢占已认领端口；1 = 用户手动切换，强制互换)
+     */
+    if (msg_len == 3 && msg[0] == 0xF4 && msg[1] == 0x7D && (msg[2] & 0x0F) < BLE_MIDI_MAX_PORTS) {
+        const uint8_t desired_cable = (uint8_t)(msg[2] & 0x0F);
+        const bool force_claim = (msg[2] & 0x10) != 0;
+        bind_slot_to_cable(slot_idx, desired_cable, force_claim);
         return;
     }
 
@@ -181,7 +247,17 @@ static void dispatch_ble_midi_message(int slot_idx, const uint8_t *msg, uint16_t
     }
 
     if (s_rx_cb != NULL) {
-        s_rx_cb(s_slots[slot_idx].cable_num, msg, (uint8_t)msg_len, esp_timer_get_time());
+        uint8_t cable_num = 0;
+        bool connected = false;
+        portENTER_CRITICAL(&s_slots_lock);
+        if (s_slots[slot_idx].connected) {
+            cable_num = s_slots[slot_idx].cable_num;
+            connected = true;
+        }
+        portEXIT_CRITICAL(&s_slots_lock);
+        if (connected) {
+            s_rx_cb(cable_num, msg, (uint8_t)msg_len, esp_timer_get_time());
+        }
     }
 }
 
@@ -224,8 +300,10 @@ static void parse_ble_midi_packet(int slot_idx, const uint8_t *data, uint16_t le
                 if (sysex_len == 5 &&
                     data[sysex_start + 1] == 0x7D &&
                     data[sysex_start + 2] == 0x01 &&
-                    data[sysex_start + 3] < BLE_MIDI_MAX_PORTS) {
-                    bind_slot_to_cable(slot_idx, data[sysex_start + 3]);
+                    (data[sysex_start + 3] & 0x0F) < BLE_MIDI_MAX_PORTS) {
+                    bind_slot_to_cable(slot_idx,
+                                       (uint8_t)(data[sysex_start + 3] & 0x0F),
+                                       (data[sysex_start + 3] & 0x10) != 0);
                 } else {
                     s_rx_unsupported++;
                 }
@@ -337,7 +415,9 @@ static int gatt_svr_chr_access_midi(uint16_t conn_handle, uint16_t attr_handle,
         if (ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf), &flat_len) != 0) {
             return BLE_ATT_ERR_UNLIKELY;
         }
-        const int slot_idx = find_slot_by_conn_handle(conn_handle);
+        portENTER_CRITICAL(&s_slots_lock);
+        const int slot_idx = find_slot_by_conn_handle_locked(conn_handle);
+        portEXIT_CRITICAL(&s_slots_lock);
         if (slot_idx >= 0) {
             parse_ble_midi_packet(slot_idx, buf, flat_len);
         }
@@ -453,28 +533,35 @@ static int ble_midi_gap_event(struct ble_gap_event *event, void *arg)
 
         const uint16_t handle = event->connect.conn_handle;
         int slot_idx = -1;
+        uint8_t default_cable = 0;
+        int total_connected = 0;
+        portENTER_CRITICAL(&s_slots_lock);
         for (int i = 0; i < BLE_MIDI_MAX_PORTS; i++) {
             if (!s_slots[i].connected) {
                 slot_idx = i;
                 break;
             }
         }
+        if (slot_idx >= 0) {
+            default_cable = allocate_default_cable_locked(slot_idx);
+            s_slots[slot_idx].connected = true;
+            s_slots[slot_idx].notify_enabled = false;
+            s_slots[slot_idx].explicit_claim = false;
+            s_slots[slot_idx].conn_handle = handle;
+            s_slots[slot_idx].mtu = 23;
+            s_slots[slot_idx].cable_num = default_cable;
+            total_connected = connected_slot_count_locked();
+        }
+        portEXIT_CRITICAL(&s_slots_lock);
+
         if (slot_idx < 0) {
             ESP_LOGW(TAG, "no free slot for handle=%u; disconnecting", handle);
             ble_gap_terminate(handle, BLE_ERR_REM_USER_CONN_TERM);
             return 0;
         }
 
-        const uint8_t default_cable = allocate_default_cable(slot_idx);
-        s_slots[slot_idx].connected = true;
-        s_slots[slot_idx].notify_enabled = false;
-        s_slots[slot_idx].explicit_claim = false;
-        s_slots[slot_idx].conn_handle = handle;
-        s_slots[slot_idx].mtu = 23;
-        s_slots[slot_idx].cable_num = default_cable;
-
         ESP_LOGI(TAG, "connected slot=%d handle=%u default_cable=%u (connected=%d/%d)",
-                 slot_idx, handle, default_cable, connected_slot_count(), BLE_MIDI_MAX_PORTS);
+                 slot_idx, handle, default_cable, total_connected, BLE_MIDI_MAX_PORTS);
 
         struct ble_gap_upd_params params = {
             .itvl_min = 6,              /* 7.5 ms */
@@ -496,11 +583,18 @@ static int ble_midi_gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISCONNECT: {
         const uint16_t handle = event->disconnect.conn.conn_handle;
-        const int slot_idx = find_slot_by_conn_handle(handle);
+        int slot_idx = -1;
+        uint8_t old_cable = 0;
+        portENTER_CRITICAL(&s_slots_lock);
+        slot_idx = find_slot_by_conn_handle_locked(handle);
+        if (slot_idx >= 0) {
+            old_cable = s_slots[slot_idx].cable_num;
+            memset(&s_slots[slot_idx], 0, sizeof(s_slots[slot_idx]));
+        }
+        portEXIT_CRITICAL(&s_slots_lock);
         if (slot_idx >= 0) {
             ESP_LOGI(TAG, "disconnected slot=%d handle=%u cable=%u reason=0x%04x",
-                     slot_idx, handle, s_slots[slot_idx].cable_num, event->disconnect.reason);
-            memset(&s_slots[slot_idx], 0, sizeof(s_slots[slot_idx]));
+                     slot_idx, handle, old_cable, event->disconnect.reason);
         }
         start_advertising_if_needed();
         return 0;
@@ -508,21 +602,37 @@ static int ble_midi_gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_SUBSCRIBE: {
         if (event->subscribe.attr_handle == s_midi_chr_val_handle) {
-            const int slot_idx = find_slot_by_conn_handle(event->subscribe.conn_handle);
+            const bool enabled = (event->subscribe.cur_notify != 0);
+            int slot_idx = -1;
+            uint8_t cable_num = 0;
+            portENTER_CRITICAL(&s_slots_lock);
+            slot_idx = find_slot_by_conn_handle_locked(event->subscribe.conn_handle);
             if (slot_idx >= 0) {
-                s_slots[slot_idx].notify_enabled = (event->subscribe.cur_notify != 0);
+                s_slots[slot_idx].notify_enabled = enabled;
+                cable_num = s_slots[slot_idx].cable_num;
+            }
+            portEXIT_CRITICAL(&s_slots_lock);
+            if (slot_idx >= 0) {
                 ESP_LOGI(TAG, "slot=%d handle=%u cable=%u MIDI notify %s",
-                         slot_idx, event->subscribe.conn_handle, s_slots[slot_idx].cable_num,
-                         s_slots[slot_idx].notify_enabled ? "enabled" : "disabled");
+                         slot_idx, event->subscribe.conn_handle, cable_num,
+                         enabled ? "enabled" : "disabled");
+                if (enabled) {
+                    notify_port_assignment(event->subscribe.conn_handle, cable_num);
+                }
             }
         }
         return 0;
     }
 
     case BLE_GAP_EVENT_MTU: {
-        const int slot_idx = find_slot_by_conn_handle(event->mtu.conn_handle);
+        int slot_idx = -1;
+        portENTER_CRITICAL(&s_slots_lock);
+        slot_idx = find_slot_by_conn_handle_locked(event->mtu.conn_handle);
         if (slot_idx >= 0) {
             s_slots[slot_idx].mtu = event->mtu.value;
+        }
+        portEXIT_CRITICAL(&s_slots_lock);
+        if (slot_idx >= 0) {
             ESP_LOGI(TAG, "slot=%d handle=%u MTU=%u", slot_idx, event->mtu.conn_handle, event->mtu.value);
         }
         return 0;
@@ -609,20 +719,18 @@ esp_err_t ble_midi_link_start(void)
     return ESP_OK;
 }
 
-bool ble_midi_link_ready(void)
-{
-    for (int i = 0; i < BLE_MIDI_MAX_PORTS; i++) {
-        if (s_slots[i].connected && s_slots[i].notify_enabled) {
-            return true;
-        }
-    }
-    return false;
-}
-
 bool ble_midi_link_port_ready(uint8_t cable_num)
 {
-    const int slot_idx = find_slot_by_cable(cable_num);
-    return slot_idx >= 0 && s_slots[slot_idx].notify_enabled;
+    bool ready = false;
+    portENTER_CRITICAL(&s_slots_lock);
+    for (int i = 0; i < BLE_MIDI_MAX_PORTS; i++) {
+        if (s_slots[i].connected && s_slots[i].cable_num == cable_num) {
+            ready = s_slots[i].notify_enabled;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_slots_lock);
+    return ready;
 }
 
 esp_err_t ble_midi_link_send(uint8_t cable_num, const uint8_t *const msgs[], const uint8_t lens[], uint16_t count)
@@ -631,13 +739,25 @@ esp_err_t ble_midi_link_send(uint8_t cable_num, const uint8_t *const msgs[], con
         return ESP_ERR_INVALID_ARG;
     }
 
-    const int slot_idx = find_slot_by_cable(cable_num);
-    if (slot_idx < 0 || !s_slots[slot_idx].notify_enabled) {
+    bool ready = false;
+    uint16_t conn_handle = 0;
+    uint16_t mtu = 23;
+    portENTER_CRITICAL(&s_slots_lock);
+    for (int i = 0; i < BLE_MIDI_MAX_PORTS; i++) {
+        if (s_slots[i].connected && s_slots[i].cable_num == cable_num) {
+            ready = s_slots[i].notify_enabled;
+            conn_handle = s_slots[i].conn_handle;
+            mtu = s_slots[i].mtu >= 23 ? s_slots[i].mtu : 23;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_slots_lock);
+
+    if (!ready) {
         s_tx_dropped += count;
         return ESP_ERR_INVALID_STATE;
     }
 
-    const uint16_t mtu = s_slots[slot_idx].mtu >= 23 ? s_slots[slot_idx].mtu : 23;
     const uint16_t max_payload = (mtu - 3 <= BLE_MIDI_MAX_PKT_SIZE) ? (mtu - 3) : BLE_MIDI_MAX_PKT_SIZE;
     const uint16_t ts13 = (uint16_t)((xTaskGetTickCount() * portTICK_PERIOD_MS) & 0x1FFF);
 
@@ -672,7 +792,7 @@ esp_err_t ble_midi_link_send(uint8_t cable_num, const uint8_t *const msgs[], con
         return ESP_ERR_NO_MEM;
     }
 
-    const int rc = ble_gatts_notify_custom(s_slots[slot_idx].conn_handle, s_midi_chr_val_handle, om);
+    const int rc = ble_gatts_notify_custom(conn_handle, s_midi_chr_val_handle, om);
     if (rc != 0) {
         s_tx_dropped += count;
         return ESP_FAIL;

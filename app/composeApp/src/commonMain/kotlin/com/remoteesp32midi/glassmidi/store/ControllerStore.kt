@@ -118,8 +118,8 @@ class ControllerStore(
                             )
                         }
                         if (connection.phase == ConnectionPhase.READY) {
-                            // 先向 ESP32 发送本机所属乐手端口握手包（Port 1 / Port 2），再同步连续控件当前值。
-                            transport.send(listOf(MidiMessage.portSelect(_state.value.devicePort)))
+                            // 先向 ESP32 发送本机所属乐手端口自动握手包（force=false，不抢占正在演出的另一台手机）。
+                            transport.send(listOf(MidiMessage.portSelect(_state.value.devicePort, force = false)))
                             _state.value.controls
                                 .filter { it.kind != ControlKind.BUTTON }
                                 .forEach { sendContinuous(it, it.value) }
@@ -215,13 +215,13 @@ class ControllerStore(
         _state.update { it.copy(error = null) }
     }
 
-    /** 切换本机绑定的 ESP32 USB 虚拟端口（0 = 乐手 1 / Port 1，1 = 乐手 2 / Port 2）。 */
+    /** 用户手动切换本机绑定的 ESP32 USB 虚拟端口（0 = 乐手 1 / Port 1，1 = 乐手 2 / Port 2）。 */
     fun setDevicePort(portIndex: Int) {
         val normalized = portIndex.coerceIn(0, 1)
         if (_state.value.devicePort == normalized) return
         _state.update { it.copy(devicePort = normalized) }
         if (_state.value.connection.phase == ConnectionPhase.READY) {
-            transport.send(listOf(MidiMessage.portSelect(normalized)))
+            transport.send(listOf(MidiMessage.portSelect(normalized, force = true)))
             _state.value.controls
                 .filter { it.kind != ControlKind.BUTTON }
                 .forEach { sendContinuous(it, it.value) }
@@ -541,6 +541,14 @@ class ControllerStore(
         val controls = _state.value.controls
 
         for (message in messages) {
+            if (message.isPortHandshake) {
+                val assignedPort = message.handshakePortIndex
+                if (_state.value.devicePort != assignedPort) {
+                    _state.update { it.copy(devicePort = assignedPort) }
+                    changed = true
+                }
+                continue
+            }
             if (!message.isChannelVoice) continue
             val channel = message.channel + 1
             when {
@@ -668,18 +676,34 @@ class ControllerStore(
         if (snapshot.isEmpty()) return
         pendingContinuous.value = emptyMap()
         val byId = _state.value.controls.associateBy { it.id }
+        val allMessages = ArrayList<MidiMessage>(snapshot.size * 2)
         snapshot.forEach { (id, value) ->
-            byId[id]?.let { sendContinuous(it, value) }
+            byId[id]?.let { control ->
+                allMessages.addAll(continuousMessages(control, value))
+            }
+        }
+        if (allMessages.isNotEmpty()) {
+            // 将同一 10ms 节流窗口内所有推子/旋钮变动打包进标准 BLE-MIDI 多消息帧（最多 8 条/包），
+            // 多指同拖 4 根推子时包率依然恒定 ≤ 100 包/s，消除写队列积压。
+            allMessages.chunked(MAX_MESSAGES_PER_PACKET).forEach { batch ->
+                transport.send(batch)
+            }
         }
     }
 
     private fun sendContinuous(control: Control, value: Int) {
+        val messages = continuousMessages(control, value)
+        if (messages.isNotEmpty()) {
+            transport.send(messages)
+        }
+    }
+
+    private fun continuousMessages(control: Control, value: Int): List<MidiMessage> {
         val channel = control.mapping.channel
         when (control.mapping.type) {
-            MidiType.NOTE -> return
+            MidiType.NOTE -> return emptyList()
             MidiType.PITCH_BEND -> {
-                transport.send(listOf(MidiMessage.pitchBend(channel, value.coerceIn(0, 16383))))
-                return
+                return listOf(MidiMessage.pitchBend(channel, value.coerceIn(0, 16383)))
             }
 
             MidiType.CC -> Unit
@@ -688,19 +712,14 @@ class ControllerStore(
         if (control.mapping.resolution == MidiResolution.SEVEN_BIT) {
             // DAW 兼容模式：只发一个 7-bit CC。Ableton 等 DAW 的 MIDI Learn
             // 不会把 14-bit 的 LSB 当成独立控制器，避免发送旋钮来回跳。
-            transport.send(
-                listOf(MidiMessage.controlChange(channel, number, (value shr 7) and 0x7F))
-            )
-            return
+            return listOf(MidiMessage.controlChange(channel, number, (value shr 7) and 0x7F))
         }
         val msb = (value shr 7) and 0x7F
         val lsb = value and 0x7F
-        transport.send(
-            listOf(
-                MidiMessage.controlChange(channel, number, msb),
-                // 标准 14-bit CC：MSB 0..31，LSB 固定为 MSB + 32。
-                MidiMessage.controlChange(channel, number + 32, lsb),
-            )
+        return listOf(
+            MidiMessage.controlChange(channel, number, msb),
+            // 标准 14-bit CC：MSB 0..31，LSB 固定为 MSB + 32。
+            MidiMessage.controlChange(channel, number + 32, lsb),
         )
     }
 
@@ -732,5 +751,6 @@ class ControllerStore(
         private const val CONTINUOUS_INTERVAL_MS = 10L
         private const val ECHO_SUPPRESSION_MS = 200L
         private const val SAVE_DEBOUNCE_MS = 300L
+        private const val MAX_MESSAGES_PER_PACKET = 8
     }
 }

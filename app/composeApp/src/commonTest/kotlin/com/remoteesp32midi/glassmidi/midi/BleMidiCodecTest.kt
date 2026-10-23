@@ -67,6 +67,17 @@ class BleMidiCodecTest {
     }
 
     @Test
+    fun decodeSupportsPortHandshakeSystemCommonMessage() {
+        val encoded = codec.encode(
+            listOf(MidiMessage.portSelect(1, force = true)),
+            timestampMs = 123,
+        )
+        val decoded = codec.decode(encoded).single()
+        assertTrue(decoded.isPortHandshake)
+        assertEquals(1, decoded.handshakePortIndex)
+    }
+
+    @Test
     fun malformedDataByteIsRejected() {
         assertFailsWith<IllegalArgumentException> {
             codec.decode(byteArrayOf(0x80.toByte(), 0x80.toByte(), 0x90.toByte(), 0x3C))

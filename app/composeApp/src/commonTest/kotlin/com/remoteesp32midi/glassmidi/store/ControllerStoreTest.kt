@@ -466,12 +466,12 @@ class ControllerStoreTest {
     }
 
     @Test
-    fun devicePortHandshakeIsSentOnReadyAndWhenSwitched() = runTest {
+    fun devicePortHandshakeIsSentOnReadyAndSyncedFromFirmwareReceipt() = runTest {
         val transport = FakeTransport()
-        val layoutStore = InMemoryLayoutStore(PersistedState(devicePort = 1))
+        val layoutStore = InMemoryLayoutStore(PersistedState(devicePort = 0))
         val store = ControllerStore(transport, layoutStore, backgroundScope)
         runCurrent()
-        assertEquals(1, store.state.value.devicePort)
+        assertEquals(0, store.state.value.devicePort)
 
         transport.emit(
             TransportEvent.ConnectionChanged(
@@ -483,11 +483,18 @@ class ControllerStoreTest {
             )
         )
         runCurrent()
-        assertEquals(listOf(MidiMessage.portSelect(1)), transport.sent.first())
+        // 连接 READY 时发送自动握手（force = false，不抢占另一台正在演出的手机）
+        assertEquals(listOf(MidiMessage.portSelect(0, force = false)), transport.sent.first())
 
+        // 若固件因 Port 1 已被占用而下发回执 [0xF4, 0x7D, 0x01]，App 自动同步为 Port 2
+        transport.emitIncoming(listOf(MidiMessage.portSelect(1, force = false)))
+        runCurrent()
+        assertEquals(1, store.state.value.devicePort)
+
+        // 用户手动切换为 Port 1 时发送强制握手（force = true）
         store.setDevicePort(0)
         assertEquals(0, store.state.value.devicePort)
-        assertEquals(listOf(MidiMessage.portSelect(0)), transport.sent.last())
+        assertTrue(transport.sent.contains(listOf(MidiMessage.portSelect(0, force = true))))
     }
 
     private fun androidxMidiMapping(

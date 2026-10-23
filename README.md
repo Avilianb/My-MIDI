@@ -1,28 +1,27 @@
-# Glass MIDI — BLE MIDI 控制器
+# My MIDI — 双手机 BLE-MIDI ↔ 双虚拟端口 USB-MIDI 控制器
 
 ```text
-Android App (Compose Multiplatform + Backdrop)
-        ⇅  BLE-MIDI (standard GATT service)
-ESP32-S3 (BLE peripheral + USB-MIDI device)
-        ⇅  USB-MIDI class
-Windows / macOS / Linux + DAW
+手机 A / 乐手 1 (My MIDI App) ──┐
+                                 ⇅  BLE-MIDI (NimBLE 双连接 + 端口握手回执)
+手机 B / 乐手 2 (My MIDI App) ──┴─► ESP32-S3 (BLE peripheral + TinyUSB 双虚拟线缆)
+                                 ⇅  USB-MIDI (Cable 0: Port 1 / Cable 1: Port 2)
+                             Windows / macOS / Linux + DAW (Ableton Live 等)
 ```
 
-- `firmware/`：ESP-IDF 5.5.2 固件；BLE↔USB 双向桥、断线清音、延迟统计。
+- `firmware/`：ESP-IDF 5.5.2 固件；原生 NimBLE 双手机连接、单广播实例、TinyUSB 双虚拟线缆（Port 1 / Port 2）、活跃音符状态表防卡音、按端口独立断线清音与延迟统计。
   构建/烧录/验收见 [firmware/README.md](firmware/README.md)。
-- `app/`:Android App;控件编辑、BLE 连接/重连、14-bit CC / Pitch Bend、布局持久化。
-  构建/测试/阶段 4 验收见 [app/README.md](app/README.md)。
+- `app/`：Android App（`My MIDI`）；4 通道整体台面、Ableton Live 标准 dB 刻度推子、预设锁定通道映射、双乐手端口选择与自动握手回执、双向反馈与布局持久化。
+  构建/测试/验收见 [app/README.md](app/README.md)。
 
 ## 当前阶段
 
 | 阶段 | 状态 |
 |---|---|
-| 1 技术选型 | 已确认：ESP-IDF + Compose Multiplatform(Android) + 标准 BLE-MIDI |
-| 2 USB-MIDI 单独跑通 | 已完成 |
-| 3 BLE 桥接 + nRF Connect 验收 | 已完成（固件 README 有实测记录） |
-| 4 Android App 连接 + 基础控件 | 真机扫描/连接已验证；控件与持久化完成 |
-| 5 双向反馈、配置/布局保存 | 回传 UI、14-bit 配对、布局保存已实现；DAW 回传实测待做 |
-
+| 1 技术选型 | 已完成：ESP-IDF 5.5.2 (NimBLE + TinyUSB) + Compose Multiplatform (Android) |
+| 2 USB-MIDI 双虚拟线缆 | 已完成：单接口枚举 `ESP32-S3 MIDI 1` (Cable 0) 与 `ESP32-S3 MIDI 2` (Cable 1) |
+| 3 BLE 双手机桥接 + 防卡音 | 已完成：支持 2 台手机同时连接、端口认领与 Notify 回执、Note Off 挂起补发 |
+| 4 Android App 调音台控件 | 已完成：整块玻璃台面、Ableton dB 推子、预设 MIDI 通道映射、常亮防息屏 |
+| 5 双向反馈与现场稳定性 | 已完成：200ms 触控回声抑制、14-bit CC 配对、高优 Note 发送通道与连接看门狗 |
 ## 快速构建
 
 ```powershell

@@ -26,6 +26,10 @@ data class MidiMessage(
     val isNoteOn: Boolean get() = command == 0x90 && (data2 ?: 0) > 0
 
     val isNoteOff: Boolean get() = command == 0x80 || (command == 0x90 && (data2 ?: 0) == 0)
+    val isPortHandshake: Boolean get() = status == 0xF4 && data1 == 0x7D && data2 != null
+
+    val handshakePortIndex: Int get() = (data2 ?: 0) and 0x01
+
 
     fun toBytes(): ByteArray {
         val second = data2
@@ -57,11 +61,12 @@ data class MidiMessage(
         }
 
         /**
-         * 发送给 ESP32-S3 的端口握手消息（[0xF4, 0x7D, portIndex]）。
-         * 固件拦截此消息并将当前手机连接绑定到 USB 虚拟端口 portIndex (0 = Port 1, 1 = Port 2)，不会转发到电脑。
+         * 发送给 ESP32-S3 的端口握手消息（[0xF4, 0x7D, payload]）。
+         * - bit 0: portIndex (0 = Port 1, 1 = Port 2)
+         * - bit 4: force (false = 连接/重连自动握手，不抢占另一台正在演出的手机；true = 用户手动点击切换，强制互换)
          */
-        fun portSelect(portIndex: Int): MidiMessage =
-            MidiMessage(0xF4, 0x7D, portIndex.coerceIn(0, 1))
+        fun portSelect(portIndex: Int, force: Boolean = false): MidiMessage =
+            MidiMessage(0xF4, 0x7D, portIndex.coerceIn(0, 1) or if (force) 0x10 else 0x00)
 
         private fun channelZeroBased(channel: Int): Int {
             require(channel in 1..16) { "channel out of range: $channel" }

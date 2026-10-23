@@ -41,14 +41,16 @@ class BleMidiCodec {
             if (first and 0x80 != 0) {
                 index++
                 val status = first
-                require(status in 0x80..0xEF) { "unsupported status: 0x${status.toString(16)}" }
+                require(status in 0x80..0xEF || status == 0xF4) {
+                    "unsupported status: 0x${status.toString(16)}"
+                }
                 val dataLength = dataLengthFor(status) - 1
                 val data = IntArray(dataLength)
                 for (i in data.indices) {
                     data[i] = packet.readDataByte(index + i, "status 0x${status.toString(16)} data")
                 }
                 index += dataLength
-                runningStatus = status
+                runningStatus = if (status in 0x80..0xEF) status else null
                 messages += MidiMessage(
                     status = status,
                     data1 = data[0],
