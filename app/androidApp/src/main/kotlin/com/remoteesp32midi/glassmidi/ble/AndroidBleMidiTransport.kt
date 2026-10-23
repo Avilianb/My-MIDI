@@ -24,12 +24,15 @@ import com.remoteesp32midi.glassmidi.model.MidiMessage
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -65,9 +68,12 @@ class AndroidBleMidiTransport(
 
     private val sendQueue = Channel<ByteArray>(capacity = 256)
     private val writeMutex = Mutex()
-
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val writeDispatcher = Dispatchers.IO.limitedParallelism(1)
     private val foundDevices = ConcurrentHashMap<String, BleDevice>()
     private var scanTimeoutJob: Job? = null
+    private var scanPublishJob: Job? = null
+    @Volatile private var scanDevicesDirty = false
     private var reconnectJob: Job? = null
     @Volatile private var gatt: BluetoothGatt? = null
     @Volatile private var midiCharacteristic: BluetoothGattCharacteristic? = null
@@ -77,7 +83,7 @@ class AndroidBleMidiTransport(
     @Volatile private var lastConnection = BleConnection()
 
     init {
-        scope.launch {
+        scope.launch(writeDispatcher) {
             for (packet in sendQueue) {
                 writePacket(packet)
                 // Android 的 GATT 操作一次只能有一个；留出连接间隔给协议栈。
@@ -122,16 +128,33 @@ class AndroidBleMidiTransport(
             return
         }
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            // LOW_LATENCY 会让 BLE 栈持续以最高占空比扫描；附近广播一多，
+            // UI 线程就会被抢 CPU，表现为未连接也卡顿。配网扫描用 BALANCED
+            // 足够，10 秒超时内仍能发现 ESP32。
+            .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
             // 固件用 BLE 5 扩展广播（UUID+名称超过 31 字节）。Android 默认
             // legacy=true，只回传传统广播，因此这里必须显式接收扩展广播。
             .setLegacy(false)
             .setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
             .build()
         Log.d(TAG, "startScan legacy=false phy=ALL")
+        scanDevicesDirty = false
+        scanPublishJob?.cancel()
+        scanPublishJob = scope.launch {
+            // 把广播风暴合并成 4Hz 的设备列表更新，避免每个广播都触发整页重组。
+            while (isActive) {
+                delay(DEVICE_PUBLISH_INTERVAL_MS)
+                if (scanDevicesDirty) {
+                    scanDevicesDirty = false
+                    publishDevices()
+                }
+            }
+        }
         try {
             scanner.startScan(null, settings, scanCallback)
         } catch (error: SecurityException) {
+            scanPublishJob?.cancel()
+            scanPublishJob = null
             publishError("蓝牙扫描权限被拒绝")
             return
         }
@@ -148,6 +171,9 @@ class AndroidBleMidiTransport(
     override fun stopScan() {
         scanTimeoutJob?.cancel()
         scanTimeoutJob = null
+        scanPublishJob?.cancel()
+        scanPublishJob = null
+        scanDevicesDirty = false
         if (hasScanPermission()) {
             runCatching { adapter?.bluetoothLeScanner?.stopScan(scanCallback) }
         }
@@ -212,23 +238,24 @@ class AndroidBleMidiTransport(
             val advertisedUuid = record?.serviceUuids?.any {
                 it.uuid == SERVICE_UUID
             } == true
-            val name = record?.deviceName
-                ?: runCatching { result.device.name }.getOrNull()
-            Log.d(TAG, "scan result ${result.device.address} name=$name uuid=$advertisedUuid")
-            if (!advertisedUuid && name?.contains("ESP32-S3 MIDI") != true) return
+            // 先过滤再取 name：result.device.name 可能走 binder，且无关广播
+            // 不应产生日志/设备列表更新。
+            val advertisedName = record?.deviceName
+            if (!advertisedUuid && advertisedName?.contains("ESP32-S3 MIDI") != true) return
             val device = BleDevice(
-                name = name ?: "ESP32-S3 MIDI",
+                name = advertisedName ?: "ESP32-S3 MIDI",
                 address = result.device.address,
                 rssi = result.rssi,
             )
             foundDevices[device.address] = device
-            _events.tryEmit(
-                TransportEvent.Devices(foundDevices.values.sortedByDescending { it.rssi })
-            )
+            scanDevicesDirty = true
+            Log.d(TAG, "matched scan result ${device.address} rssi=${device.rssi} uuid=$advertisedUuid")
         }
 
         override fun onScanFailed(errorCode: Int) {
             Log.w(TAG, "scan failed code=$errorCode")
+            scanPublishJob?.cancel()
+            scanPublishJob = null
             publishError("BLE 扫描失败，code=$errorCode")
             emitConnection(BleConnection(phase = ConnectionPhase.IDLE))
         }
@@ -473,6 +500,12 @@ class AndroidBleMidiTransport(
         }
     }
 
+    private fun publishDevices() {
+        _events.tryEmit(
+            TransportEvent.Devices(foundDevices.values.sortedByDescending { it.rssi })
+        )
+    }
+
     private fun emitConnection(connection: BleConnection) {
         lastConnection = connection
         _events.tryEmit(TransportEvent.ConnectionChanged(connection))
@@ -509,6 +542,7 @@ class AndroidBleMidiTransport(
 
         private const val MTU_REQUEST = 247
         private const val SCAN_TIMEOUT_MS = 10_000L
+        private const val DEVICE_PUBLISH_INTERVAL_MS = 250L
         private const val WRITE_PACING_MS = 3L
         private const val WRITE_RETRY_DELAY_MS = 4L
         private const val WRITE_RETRIES = 5

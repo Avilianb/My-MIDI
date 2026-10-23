@@ -1,7 +1,7 @@
 # Glass MIDI Android App
 
 手机端通过标准 BLE-MIDI（GATT）连接 ESP32-S3，向固件发送 Note/CC，并接收固件回传的
-USB→BLE 消息。界面使用 Compose Multiplatform + Backdrop 液态玻璃效果。
+USB→BLE 消息。界面使用 Compose Multiplatform + Backdrop 液态玻璃效果，页面背景为小红书风格的纯白 `#FFFFFF`。
 
 当前阶段：**阶段 5（双向反馈、14-bit 配对、布局保存）代码完成；DAW 回传真机验收待做。**
 
@@ -65,16 +65,20 @@ iOS target；`composeApp` 的公共代码未使用 Android API，后续可按 KM
 ## 使用
 
 1. 打开 App，允许蓝牙扫描/连接权限；Android 13+ 还会请求通知权限（前台服务通知）。
-2. 点右上角“扫描”，选择 `ESP32-S3 MIDI`。连接成功后状态变为“已连接”。
-3. 点“添加控件”，选择 Button / Knob / Fader：
-   - Button：Note 或 7-bit CC，按下 127，松开 0 / Note Off。
-   - Knob/Fader：固定 14-bit CC；MSB 为编号（0–31），LSB 自动使用 `MSB + 32`。
-   - 通道 1–16 可调；名称、MIDI 类型、编号可在编辑器中修改。
-4. 旋钮上下拖动，推子上下拖动；值范围 0–16383。松手立即发送最终值，拖动期间每 10 ms
-   最多发送一帧，避免 BLE 写队列被淹没。
-5. 布局、控件映射和最后一次连接地址自动保存；杀掉 App 后重开仍会恢复。
+2. 顶部连接状态或底部“连接设置”进入连接页，点“扫描设备”，选择 `ESP32-S3 MIDI`。连接成功后状态变为“已连接”。
+3. 默认台面是 4 条通道条，每条由 1 个 Fader + 3 个 Knob 组成；通道条内不再放 Button。
+   所有通道条下方只有一个全局 Button，使用液态玻璃胶囊样式。自定义台面（`自定义` tab）可增删/移动通道、
+   点按控件编辑 MIDI 映射；全局 Button 始终保留在通道条下方。
+4. Fader 上下拖动、Knob 上下拖动；两者都按相对拖动距离累计，松手立即发送最终值。为了降低灵敏度，
+   Fader 约 350dp、Knob 约 300dp 行程对应完整 0–16383，而不是以前的 175/150dp。
+   Button 按下发送 127、松开发送 0 / Note Off；全局 Button 同样支持 Note、7-bit CC 和通道选择。
+5. 布局、控件映射和最后一次连接地址自动保存；杀掉 App 后重开仍会恢复。旧版每通道带 2 个 Button 的布局会自动迁移：
+   保留 Fader/Knob，取第一个 Button 作为全局 Button。
 6. 连接断开后自动按 0.5/1/2/5 秒退避重连；再次 Ready 会重发所有连续控件当前值，
    Button 显示状态清零。
+7. 底部三栏 Liquid Glass Dock 是页面切换器：控制 / 自定义 / 连接设置。Dock 是浮在内容上方的玻璃胶囊，
+   不占布局高度；当前 tab 有一层 catalog 同款的浅灰玻璃面与边框（选中滑块仍保留玻璃透镜）。
+   控制页是调音台通道条；自定义页显示映射标签和通道管理按钮；连接设置页处理 BLE。
 
 ### 权限
 
@@ -97,14 +101,24 @@ App 严格使用标准 BLE-MIDI：
   `ScanSettings` 显式设置 `setLegacy(false)` + `PHY_LE_ALL_SUPPORTED`。不要改回只扫描
   legacy 广播，否则会表现为“系统蓝牙能看到、App 扫描不到”。
 - 每个通知/写入由 `80 <timestamp>` 头开始，后接原始 MIDI 字节。编码器在同一个写入包内
-  携带一条消息；14-bit 旋钮/推子把 MSB、LSB 两条 CC 放在同一个包里，顺序固定为
-  MSB→LSB，保证固件能用同一时间戳配对。
+  携带一条消息；14-bit CC 旋钮/推子把 MSB、LSB 两条 CC 放在同一个包里，顺序固定为
+  MSB→LSB，保证固件能用同一时间戳配对。Pitch Bend 是单条 `E0 <LSB> <MSB>`，不需要配对。
 
 例：Knob 映射 CH1 CC1，值 8192（0x2000）：
 
 ```text
 80 <ts> B0 01 40 B0 21 00
 ```
+
+### 7-bit / 14-bit 规则
+
+- 7-bit 连续控件只发送一个 CC（0–127），适合 DAW 的 MIDI Learn / 遥控映射。
+- 14-bit CC 连续控件发送 MSB、LSB 两个 CC；DAW 若只把 LSB 学成独立控制器，拖动时
+  参数会按 0→127→0 反复回绕，表现为发送旋钮乱抖。
+- 14-bit **Pitch Bend** 是单条 `E0 <LSB> <MSB>`，不占用 CC 编号；Ableton 手动
+  Learn 时直接拖动即可学成高分辨率，不会出现 LSB 歧义。每个通道只能有一个。
+- 同一通道上，7-bit 控件不得占用某个 14-bit 控件的 MSB 或 LSB 编号；Pitch Bend
+  与 CC 编号互不冲突。
 
 ### 14-bit 规则
 
@@ -116,6 +130,14 @@ App 严格使用标准 BLE-MIDI：
 - 旧版本若保存过 >31 的 14-bit 编号，加载时会自动迁移到同通道空闲的标准 MSB
   （优先 1..31），保留控件和值。
 
+### Pitch Bend 规则
+
+- 单条 `E0 <LSB> <MSB>`：`data1` 是低 7 位，`data2` 是高 7 位；范围 0–16383。
+- 不占用 CC 编号，与 CC 控件互不冲突；每个 MIDI 通道只能有一个 Pitch Bend 控件。
+- 固件按普通 3 字节通道消息转发（USB CIN 0x0E），无需修改固件。
+- Ableton：MIDI Map 里点参数后直接拖动控件即可学习；Pitch Bend 是单条 14-bit，
+  不会出现 14-bit CC 对“学到 LSB”的歧义。
+
 ## 阶段 4 验收
 
 ### 已在本机验证（Android 模拟器，无 ESP32）
@@ -125,9 +147,10 @@ App 严格使用标准 BLE-MIDI：
 | Debug 构建 | `BUILD SUCCESSFUL`，APK 约 9.2 MB |
 | commonTest | 编解码、映射校验、Store 状态机全部通过（`gradlew :composeApp:jvmTest`） |
 | 启动/权限 | 模拟器启动、扫描入口可点，进入“正在扫描 ESP32-S3 MIDI”状态 |
-| 添加/编辑控件 | Button、Knob、Fader 可创建；名称/通道/编号/类型可编辑 |
+| 通道条 | 4 条 ×（Fader + 3 Knob），通道条内无 Button |
+| 全局按钮 | 所有通道条下方只有一个液态玻璃 Button；控制页按压、自定义页点按编辑 |
 | 校验 | 14-bit CC 冲突实时提示并禁用保存；改到空闲编号后可保存 |
-| 手势 | Knob 拖动值变化，松手发送最终值；Fader 拖动值变化 |
+| 手势 | Fader/Knob 竖向拖动；灵敏度已降至 350/300dp 满量程；全局 Button 按压 |
 | 持久化 | 杀掉进程重开，控件布局从 `files/layout.json` 恢复 |
 | 返回/重连 UI | 未连接、扫描中、错误状态可切换；未做硬件重连验收 |
 

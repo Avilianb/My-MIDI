@@ -10,7 +10,7 @@ Windows / macOS / Linux + DAW
 
 - `firmware/`：ESP-IDF 5.5.2 固件；BLE↔USB 双向桥、断线清音、延迟统计。
   构建/烧录/验收见 [firmware/README.md](firmware/README.md)。
-- `app/`：Android App；控件编辑、BLE 连接/重连、14-bit CC、布局持久化。
+- `app/`:Android App;控件编辑、BLE 连接/重连、14-bit CC / Pitch Bend、布局持久化。
   构建/测试/阶段 4 验收见 [app/README.md](app/README.md)。
 
 ## 当前阶段

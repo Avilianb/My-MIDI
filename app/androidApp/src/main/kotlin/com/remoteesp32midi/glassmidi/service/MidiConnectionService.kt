@@ -15,20 +15,40 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.remoteesp32midi.glassmidi.GlassMidiApplication
 import com.remoteesp32midi.glassmidi.MainActivity
+import com.remoteesp32midi.glassmidi.ble.BleConnection
 import com.remoteesp32midi.glassmidi.ble.ConnectionPhase
-import com.remoteesp32midi.glassmidi.store.UiState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 class MidiConnectionService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var container: com.remoteesp32midi.glassmidi.AppContainer
     private var notificationJob: Job? = null
+    private val openAppIntent: PendingIntent by lazy {
+        PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+    private val disconnectIntent: PendingIntent by lazy {
+        PendingIntent.getService(
+            this,
+            1,
+            Intent(this, MidiConnectionService::class.java).setAction(ACTION_DISCONNECT),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -36,9 +56,12 @@ class MidiConnectionService : Service() {
         createChannel()
         startForeground()
         notificationJob = scope.launch {
-            container.store.state.collectLatest { state ->
-                notificationManager.notify(NOTIFICATION_ID, buildNotification(state))
-            }
+            container.store.state
+                .map { it.connection }
+                .distinctUntilChanged()
+                .collectLatest { connection ->
+                    notificationManager.notify(NOTIFICATION_ID, buildNotification(connection))
+                }
         }
     }
 
@@ -69,13 +92,12 @@ class MidiConnectionService : Service() {
         ServiceCompat.startForeground(
             this,
             NOTIFICATION_ID,
-            buildNotification(container.store.state.value),
+            buildNotification(container.store.state.value.connection),
             type,
         )
     }
 
-    private fun buildNotification(state: UiState): Notification {
-        val connection = state.connection
+    private fun buildNotification(connection: BleConnection): Notification {
         val (title, text) = when (connection.phase) {
             ConnectionPhase.READY -> "已连接" to (connection.deviceName ?: "ESP32-S3 MIDI")
             ConnectionPhase.CONNECTING -> "正在连接" to (connection.deviceName ?: "ESP32-S3 MIDI")
@@ -84,29 +106,15 @@ class MidiConnectionService : Service() {
             ConnectionPhase.ERROR -> "连接异常" to (connection.detail ?: "请回到 App 检查")
             ConnectionPhase.IDLE -> "等待连接" to "打开 Glass MIDI 选择设备"
         }
-        val openApp = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        val disconnect = PendingIntent.getService(
-            this,
-            1,
-            Intent(this, MidiConnectionService::class.java).setAction(ACTION_DISCONNECT),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentTitle("Glass MIDI · $title")
             .setContentText(text)
-            .setContentIntent(openApp)
+            .setContentIntent(openAppIntent)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setSilent(true)
-            .addAction(0, "断开", disconnect)
+            .addAction(0, "断开", disconnectIntent)
             .build()
     }
 

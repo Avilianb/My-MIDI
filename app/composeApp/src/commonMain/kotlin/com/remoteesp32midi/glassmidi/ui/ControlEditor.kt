@@ -32,6 +32,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.kyant.backdrop.Backdrop
 import com.remoteesp32midi.glassmidi.model.Control
+import com.remoteesp32midi.glassmidi.model.ButtonBehavior
+import com.remoteesp32midi.glassmidi.model.CONTROLS_PER_STRIP
+import com.remoteesp32midi.glassmidi.model.presetStripCcNumber
+import com.remoteesp32midi.glassmidi.model.presetStripNoteNumber
 import com.remoteesp32midi.glassmidi.model.ControlKind
 import com.remoteesp32midi.glassmidi.model.MidiMapping
 import com.remoteesp32midi.glassmidi.model.MidiResolution
@@ -47,45 +51,64 @@ fun ControlEditor(
     allControls: List<Control>,
     onDismiss: () -> Unit,
     onSave: (Control) -> String?,
-    onDelete: () -> Unit,
+    onDelete: (() -> Unit)? = null,
+    allowKindChange: Boolean = false,
 ) {
-    var draft by remember(initial.id, initial.kind) { mutableStateOf(initial) }
-    var saveError by remember { mutableStateOf<String?>(null) }
-    val validation = validateControl(draft, allControls)
-    LaunchedEffect(draft) { saveError = null }
+    val controlIndex = remember(initial.id, allControls) {
+        allControls.indexOfFirst { it.id == initial.id }.coerceAtLeast(0)
+    }
+    val stripIndex = controlIndex / CONTROLS_PER_STRIP
+    val slotIndex = controlIndex % CONTROLS_PER_STRIP
+    val lockedChannel = initial.mapping.channel
+    val lockedCcNumber = presetStripCcNumber(stripIndex, slotIndex)
+    val lockedNoteNumber = presetStripNoteNumber(stripIndex)
+    val canUsePitchBend = initial.kind == ControlKind.FADER && (stripIndex / 16 == 0)
+
+    var labelText by remember(initial.id) { mutableStateOf(initial.label) }
+    var mapping by remember(initial.id) { mutableStateOf(initial.mapping) }
+    var buttonBehavior by remember(initial.id) { mutableStateOf(initial.buttonBehavior) }
+    var saveError by remember(initial.id) { mutableStateOf<String?>(null) }
+
+    val draft = remember(initial, labelText, mapping, buttonBehavior) {
+        initial.copy(
+            label = labelText.trim(),
+            mapping = mapping,
+            buttonBehavior = buttonBehavior,
+        )
+    }
+    val validation = remember(draft, allControls) {
+        validateControl(draft, allControls)
+    }
 
     Box(
         Modifier
             .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.55f))
+            .background(Color.Black.copy(alpha = 0.35f))
             .clickable(onClick = onDismiss),
         contentAlignment = Alignment.Center,
     ) {
         GlassSurface(
             backdrop = backdrop,
             modifier = Modifier
-                .fillMaxWidth(0.92f)
-                .fillMaxHeight(0.9f)
+                .fillMaxWidth(0.90f)
                 .clickable {},
-            shape = RoundedCornerShape(32.dp),
-            tint = Color(0xFF0B1422),
+            shape = RoundedCornerShape(28.dp),
+            tint = Color.White,
             contentPadding = androidx.compose.foundation.layout.PaddingValues(20.dp),
         ) {
             Column(
-                Modifier
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
+                Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         BasicText(
-                            if (initial.id.isBlank()) "添加控件" else "编辑控件",
-                            style = TextStyle(GlassText, 24.sp, FontWeight.SemiBold),
+                            "控件设置",
+                            style = TextStyle(GlassText, 20.sp, FontWeight.SemiBold),
                         )
                         BasicText(
-                            "配置 MIDI 映射",
-                            style = TextStyle(GlassMuted, 12.sp),
+                            "通道与编号已自动锁定，可修改名称与工作模式",
+                            style = TextStyle(GlassMuted, 11.sp),
                         )
                     }
                     BasicText(
@@ -93,149 +116,178 @@ fun ControlEditor(
                         Modifier
                             .clickable(onClick = onDismiss)
                             .padding(8.dp),
-                        style = TextStyle(GlassMuted, 26.sp),
+                        style = TextStyle(GlassMuted, 24.sp),
                     )
                 }
 
-                FieldLabel("名称")
+                FieldLabel("显示名称")
                 Box(
                     Modifier
                         .fillMaxWidth()
-                        .background(Color.White.copy(alpha = 0.07f), RoundedCornerShape(16.dp)),
+                        .background(Color.Black.copy(alpha = 0.04f), RoundedCornerShape(14.dp)),
                 ) {
                     GlassTextField(
-                        value = draft.label,
+                        value = labelText,
                         onValueChange = {
-                            draft = draft.copy(label = it)
+                            labelText = it
                             saveError = null
                         },
-                        placeholder = "例如 Cutoff",
+                        placeholder = "例如 Vocal / Cutoff / Mute",
                     )
                 }
 
-                FieldLabel("控件类型")
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    ControlKind.entries.forEach { kind ->
-                        GlassPill(
-                            text = kind.displayName,
-                            onClick = {
-                                val oldKind = draft.kind
-                                val suffix = draft.label
-                                    .takeIf { it.startsWith(oldKind.displayName + " ") }
-                                    ?.removePrefix(oldKind.displayName + " ")
-                                val candidateLabel = if (suffix != null) {
-                                    "${kind.displayName} $suffix"
-                                } else {
-                                    draft.label
-                                }
-                                val uniqueLabel = if (candidateLabel.isNotBlank() &&
-                                    allControls.any { it.id != draft.id && it.label == candidateLabel }
-                                ) {
-                                    defaultControlLabel(
-                                        kind,
-                                        allControls,
-                                        draft.id,
-                                    )
-                                } else {
-                                    candidateLabel
-                                }
-                                draft = draft.copy(
-                                    label = uniqueLabel,
-                                    kind = kind,
-                                    mapping = draft.mapping.forKind(kind),
-                                    value = if (kind == ControlKind.BUTTON) {
-                                        draft.value.coerceIn(0, 127)
-                                    } else {
-                                        draft.value.coerceIn(0, 16383)
+                when (initial.kind) {
+                    ControlKind.FADER -> {
+                        FieldLabel("推子信号模式（通道 CH $lockedChannel 自动锁定）")
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (canUsePitchBend) {
+                                GlassPill(
+                                    text = "Pitch Bend 14-bit",
+                                    onClick = {
+                                        mapping = MidiMapping(
+                                            type = MidiType.PITCH_BEND,
+                                            channel = lockedChannel,
+                                            number = 0,
+                                            resolution = MidiResolution.FOURTEEN_BIT,
+                                        )
+                                        saveError = null
                                     },
+                                    backdrop = backdrop,
+                                    selected = mapping.type == MidiType.PITCH_BEND,
                                 )
-                                saveError = null
-                            },
-                            backdrop = backdrop,
-                            selected = draft.kind == kind,
-                        )
-                    }
-                }
-
-                FieldLabel("MIDI 类型")
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    MidiType.entries.forEach { type ->
-                        val enabled = draft.kind == ControlKind.BUTTON || type == MidiType.CC
-                        GlassPill(
-                            text = type.displayName,
-                            onClick = {
-                                if (enabled) draft = draft.copy(
-                                    mapping = draft.mapping.copy(
-                                        type = type,
-                                        resolution = if (draft.kind == ControlKind.BUTTON) {
-                                            MidiResolution.SEVEN_BIT
-                                        } else {
-                                            MidiResolution.FOURTEEN_BIT
-                                        },
-                                        number = if (draft.kind == ControlKind.BUTTON) {
-                                            draft.mapping.number.coerceIn(0, 127)
-                                        } else {
-                                            draft.mapping.number.coerceIn(0, 31)
-                                        },
+                            }
+                            GlassPill(
+                                text = "7-bit CC",
+                                onClick = {
+                                    mapping = MidiMapping(
+                                        type = MidiType.CC,
+                                        channel = lockedChannel,
+                                        number = lockedCcNumber,
+                                        resolution = MidiResolution.SEVEN_BIT,
                                     )
+                                    saveError = null
+                                },
+                                backdrop = backdrop,
+                                selected = mapping.type == MidiType.CC &&
+                                    mapping.resolution == MidiResolution.SEVEN_BIT,
+                            )
+                            GlassPill(
+                                text = "14-bit CC",
+                                onClick = {
+                                    mapping = MidiMapping(
+                                        type = MidiType.CC,
+                                        channel = lockedChannel,
+                                        number = lockedCcNumber,
+                                        resolution = MidiResolution.FOURTEEN_BIT,
+                                    )
+                                    saveError = null
+                                },
+                                backdrop = backdrop,
+                                selected = mapping.type == MidiType.CC &&
+                                    mapping.resolution == MidiResolution.FOURTEEN_BIT,
+                            )
+                        }
+                    }
+
+                    ControlKind.KNOB -> {
+                        FieldLabel("旋钮精度模式（CH $lockedChannel · CC $lockedCcNumber 自动锁定）")
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            GlassPill(
+                                text = "7-bit CC（通用推荐）",
+                                onClick = {
+                                    mapping = MidiMapping(
+                                        type = MidiType.CC,
+                                        channel = lockedChannel,
+                                        number = lockedCcNumber,
+                                        resolution = MidiResolution.SEVEN_BIT,
+                                    )
+                                    saveError = null
+                                },
+                                backdrop = backdrop,
+                                selected = mapping.resolution == MidiResolution.SEVEN_BIT,
+                            )
+                            GlassPill(
+                                text = "14-bit CC（高精双字节）",
+                                onClick = {
+                                    mapping = MidiMapping(
+                                        type = MidiType.CC,
+                                        channel = lockedChannel,
+                                        number = lockedCcNumber,
+                                        resolution = MidiResolution.FOURTEEN_BIT,
+                                    )
+                                    saveError = null
+                                },
+                                backdrop = backdrop,
+                                selected = mapping.resolution == MidiResolution.FOURTEEN_BIT,
+                            )
+                        }
+                    }
+
+                    ControlKind.BUTTON -> {
+                        FieldLabel("按钮触发方式")
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            ButtonBehavior.entries.forEach { behavior ->
+                                GlassPill(
+                                    text = behavior.displayName,
+                                    onClick = { buttonBehavior = behavior },
+                                    backdrop = backdrop,
+                                    selected = buttonBehavior == behavior,
                                 )
-                                saveError = null
-                            },
-                            backdrop = backdrop,
-                            selected = draft.mapping.type == type,
-                            enabled = enabled,
-                        )
+                            }
+                        }
+                        FieldLabel("按钮信号类型（通道 CH $lockedChannel 自动锁定）")
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            GlassPill(
+                                text = "Note $lockedNoteNumber（音符）",
+                                onClick = {
+                                    mapping = MidiMapping(
+                                        type = MidiType.NOTE,
+                                        channel = lockedChannel,
+                                        number = lockedNoteNumber,
+                                        resolution = MidiResolution.SEVEN_BIT,
+                                    )
+                                    saveError = null
+                                },
+                                backdrop = backdrop,
+                                selected = mapping.type == MidiType.NOTE,
+                            )
+                            GlassPill(
+                                text = "CC $lockedCcNumber（插件兼容）",
+                                onClick = {
+                                    mapping = MidiMapping(
+                                        type = MidiType.CC,
+                                        channel = lockedChannel,
+                                        number = lockedCcNumber,
+                                        resolution = MidiResolution.SEVEN_BIT,
+                                    )
+                                    saveError = null
+                                },
+                                backdrop = backdrop,
+                                selected = mapping.type == MidiType.CC,
+                            )
+                        }
                     }
                 }
 
-                FieldLabel("通道")
-                StepperRow(
-                    label = "CH ${draft.mapping.channel}",
-                    onMinus = {
-                        draft = draft.copy(
-                            mapping = draft.mapping.copy(
-                                channel = if (draft.mapping.channel <= 1) 16 else draft.mapping.channel - 1
-                            )
-                        )
-                    },
-                    onPlus = {
-                        draft = draft.copy(
-                            mapping = draft.mapping.copy(
-                                channel = if (draft.mapping.channel >= 16) 1 else draft.mapping.channel + 1
-                            )
-                        )
-                    },
-                    backdrop = backdrop,
-                )
-
-                FieldLabel(
-                    if (draft.mapping.resolution == MidiResolution.FOURTEEN_BIT) {
-                        "CC MSB（LSB = MSB + 32）"
-                    } else if (draft.mapping.type == MidiType.NOTE) {
-                        "Note 编号"
-                    } else {
-                        "CC 编号"
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(Color.Black.copy(alpha = 0.035f), RoundedCornerShape(14.dp))
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    PresetRow("锁定 MIDI 通道", "CH ${mapping.channel}")
+                    val mappingDesc = when (mapping.type) {
+                        MidiType.CC -> if (mapping.resolution == MidiResolution.FOURTEEN_BIT) {
+                            "14-bit CC ${mapping.number} (LSB ${mapping.number + 32})"
+                        } else {
+                            "7-bit CC ${mapping.number}"
+                        }
+                        MidiType.NOTE -> "Note ${mapping.number} (${buttonBehavior.displayName})"
+                        MidiType.PITCH_BEND -> "14-bit Pitch Bend（16384 级单消息）"
                     }
-                )
-                StepperRow(
-                    label = if (draft.mapping.resolution == MidiResolution.FOURTEEN_BIT) {
-                        "CC ${draft.mapping.number} / ${draft.mapping.number + 32}"
-                    } else {
-                        "${draft.mapping.type.displayName} ${draft.mapping.number}"
-                    },
-                    onMinus = {
-                        draft = draft.copy(
-                            mapping = draft.mapping.copy(number = (draft.mapping.number - 1).coerceAtLeast(0))
-                        )
-                    },
-                    onPlus = {
-                        val max = if (draft.mapping.resolution == MidiResolution.FOURTEEN_BIT) 31 else 127
-                        draft = draft.copy(
-                            mapping = draft.mapping.copy(number = (draft.mapping.number + 1).coerceAtMost(max))
-                        )
-                    },
-                    backdrop = backdrop,
-                )
+                    PresetRow("当前预设信号", mappingDesc)
+                }
 
                 val problem = validation ?: saveError
                 if (problem != null) {
@@ -245,28 +297,23 @@ fun ControlEditor(
                     )
                 }
 
-                Spacer(Modifier.height(2.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     GlassPill(
                         text = "保存",
                         onClick = {
-                            val error = onSave(draft.withDefaultLabel(allControls))
+                            val candidate = draft.withDefaultLabel(allControls)
+                            val error = onSave(candidate)
                             if (error == null) onDismiss() else saveError = error
                         },
                         backdrop = backdrop,
                         selected = true,
                         enabled = validation == null,
                     )
-                    if (initial.id.isNotBlank()) {
-                        GlassPill(
-                            text = "删除",
-                            onClick = {
-                                onDelete()
-                                onDismiss()
-                            },
-                            backdrop = backdrop,
-                        )
-                    }
+                    GlassPill(
+                        text = "取消",
+                        onClick = onDismiss,
+                        backdrop = backdrop,
+                    )
                 }
             }
         }
@@ -279,24 +326,14 @@ private fun FieldLabel(text: String) {
 }
 
 @Composable
-private fun StepperRow(
-    label: String,
-    onMinus: () -> Unit,
-    onPlus: () -> Unit,
-    backdrop: Backdrop,
-) {
+private fun PresetRow(label: String, value: String) {
     Row(
         Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        GlassPill(text = "−", onClick = onMinus, backdrop = backdrop)
-        BasicText(
-            label,
-            Modifier.weight(1f),
-            style = TextStyle(GlassText, 16.sp, FontWeight.Medium),
-        )
-        GlassPill(text = "+", onClick = onPlus, backdrop = backdrop)
+        BasicText(label, style = TextStyle(GlassMuted, 12.sp))
+        BasicText(value, style = TextStyle(GlassText, 12.sp, FontWeight.SemiBold))
     }
 }
 
@@ -308,8 +345,12 @@ private fun MidiMapping.forKind(kind: ControlKind): MidiMapping = when (kind) {
     )
 
     ControlKind.KNOB, ControlKind.FADER -> copy(
-        type = MidiType.CC,
+        type = if (type == MidiType.NOTE) MidiType.CC else type,
         resolution = MidiResolution.FOURTEEN_BIT,
-        number = if (type == MidiType.NOTE) 1 else number.coerceIn(0, 31),
+        number = when (type) {
+            MidiType.NOTE -> 1
+            MidiType.PITCH_BEND -> number
+            MidiType.CC -> number.coerceIn(0, 31)
+        },
     )
 }

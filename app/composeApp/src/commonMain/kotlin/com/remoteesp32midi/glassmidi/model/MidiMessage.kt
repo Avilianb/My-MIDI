@@ -46,6 +46,16 @@ data class MidiMessage(
         fun controlChange(channel: Int, controller: Int, value: Int): MidiMessage =
             MidiMessage(0xB0 or channelZeroBased(channel), controller, value)
 
+        /** MIDI pitch bend 的两个数据字节是 LSB 在前、MSB 在后。 */
+        fun pitchBend(channel: Int, value: Int): MidiMessage {
+            require(value in 0..16383) { "pitch bend out of range: $value" }
+            return MidiMessage(
+                0xE0 or channelZeroBased(channel),
+                value and 0x7F,
+                (value shr 7) and 0x7F,
+            )
+        }
+
         private fun channelZeroBased(channel: Int): Int {
             require(channel in 1..16) { "channel out of range: $channel" }
             return channel - 1

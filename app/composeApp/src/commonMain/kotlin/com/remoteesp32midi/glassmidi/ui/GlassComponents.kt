@@ -1,5 +1,7 @@
 package com.remoteesp32midi.glassmidi.ui
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -12,6 +14,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.SolidColor
@@ -20,39 +23,30 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.kyant.backdrop.Backdrop
-import com.kyant.backdrop.drawBackdrop
-import com.kyant.backdrop.effects.blur
-import com.kyant.backdrop.effects.lens
-import com.kyant.backdrop.effects.vibrancy
-
-val GlassAccent = Color(0xFF7DE3F4)
-val GlassAccentWarm = Color(0xFFB7A4FF)
-val GlassText = Color(0xFFF5F7FF)
-val GlassMuted = Color(0xFF9BA9C2)
-val GlassDanger = Color(0xFFFF8B9B)
+val GlassAccent = Color(0xFF0066CC)
+val GlassAccentWarm = Color(0xFF6C5CE7)
+val GlassText = Color(0xFF1C1C1E)
+val GlassMuted = Color(0xFF6E6E73)
+val GlassDanger = Color(0xFFFF3B30)
+val GlassSurfaceTint = Color(0xFFF5F5F7).copy(alpha = 0.94f)
 
 @Composable
 fun GlassSurface(
     backdrop: Backdrop,
     modifier: Modifier = Modifier,
     shape: Shape = RoundedCornerShape(28.dp),
-    tint: Color = Color.White.copy(alpha = 0.055f),
+    tint: Color = GlassSurfaceTint,
     contentPadding: PaddingValues = PaddingValues(0.dp),
     content: @Composable BoxScope.() -> Unit,
 ) {
     Box(
         modifier
-            .drawBackdrop(
-                backdrop = backdrop,
-                shape = { shape },
-                effects = {
-                    vibrancy()
-                    blur(6.dp.toPx())
-                    lens(10.dp.toPx(), 18.dp.toPx())
-                },
-                onDrawSurface = {
-                    drawRect(tint)
-                },
+            .clip(shape)
+            .background(tint)
+            .border(
+                width = 0.5.dp,
+                color = Color.Black.copy(alpha = 0.08f),
+                shape = shape,
             )
             .padding(contentPadding),
         content = content,
@@ -68,11 +62,28 @@ fun GlassPill(
     selected: Boolean = false,
     enabled: Boolean = true,
 ) {
-    GlassSurface(
-        backdrop = backdrop,
-        modifier = modifier.clickable(enabled = enabled, onClick = onClick),
-        shape = RoundedCornerShape(50),
-        tint = if (selected) GlassAccent.copy(alpha = 0.22f) else Color.White.copy(alpha = 0.055f),
+    val shape = RoundedCornerShape(50)
+    Box(
+        modifier
+            .clip(shape)
+            .background(
+                if (selected) {
+                    GlassAccent.copy(alpha = 0.16f)
+                } else {
+                    Color.Black.copy(alpha = 0.04f)
+                },
+            )
+            .border(
+                width = 0.5.dp,
+                color = if (selected) {
+                    GlassAccent.copy(alpha = 0.35f)
+                } else {
+                    Color.Black.copy(alpha = 0.08f)
+                },
+                shape = shape,
+            )
+            .clickable(enabled = enabled, onClick = onClick),
+        contentAlignment = Alignment.Center,
     ) {
         BasicText(
             text,

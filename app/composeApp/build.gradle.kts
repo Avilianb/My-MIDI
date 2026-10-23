@@ -31,6 +31,7 @@ kotlin {
             implementation(compose.foundation)
             implementation(compose.ui)
             implementation(libs.backdrop)
+            implementation(libs.kyant.shapes)
             implementation(libs.kotlinx.coroutines.core)
         }
         commonTest.dependencies {

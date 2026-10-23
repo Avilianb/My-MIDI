@@ -3,6 +3,8 @@ package com.remoteesp32midi.glassmidi.storage
 import android.content.Context
 import androidx.core.util.AtomicFile
 import com.remoteesp32midi.glassmidi.model.Control
+import com.remoteesp32midi.glassmidi.model.ButtonBehavior
+import com.remoteesp32midi.glassmidi.model.CURRENT_SCHEMA_VERSION
 import com.remoteesp32midi.glassmidi.model.ControlKind
 import com.remoteesp32midi.glassmidi.model.Layout
 import com.remoteesp32midi.glassmidi.model.MidiMapping
@@ -28,10 +30,9 @@ class AndroidLayoutStore(context: Context) : LayoutStore {
             val layoutObject = root.optJSONObject("layout")
             val controls = layoutObject?.optJSONArray("controls")?.toControls().orEmpty()
             PersistedState(
-                schemaVersion = root.optInt("schemaVersion", SCHEMA_VERSION),
+                schemaVersion = root.optInt("schemaVersion", 1),
                 layout = Layout(
-                    schemaVersion = layoutObject?.optInt("schemaVersion", SCHEMA_VERSION)
-                        ?: SCHEMA_VERSION,
+                    schemaVersion = layoutObject?.optInt("schemaVersion", 1) ?: 1,
                     controls = controls,
                 ),
                 deviceAddress = root.optString("deviceAddress").takeIf { it.isNotBlank() },
@@ -57,6 +58,7 @@ class AndroidLayoutStore(context: Context) : LayoutStore {
                                     put("label", control.label)
                                     put("kind", control.kind.name)
                                     put("value", control.value)
+                                    put("buttonBehavior", control.buttonBehavior.name)
                                     put(
                                         "mapping",
                                         JSONObject().apply {
@@ -98,6 +100,9 @@ class AndroidLayoutStore(context: Context) : LayoutStore {
             val resolution = runCatching {
                 MidiResolution.valueOf(mapping.optString("resolution"))
             }.getOrNull() ?: continue
+            val buttonBehavior = runCatching {
+                ButtonBehavior.valueOf(item.optString("buttonBehavior"))
+            }.getOrDefault(ButtonBehavior.MOMENTARY)
             val control = Control(
                 id = item.optString("id").ifBlank { "c${index + 1}" },
                 label = item.optString("label"),
@@ -109,6 +114,7 @@ class AndroidLayoutStore(context: Context) : LayoutStore {
                     resolution = resolution,
                 ),
                 value = item.optInt("value", 0),
+                buttonBehavior = buttonBehavior,
             )
             result += control
         }
@@ -117,6 +123,6 @@ class AndroidLayoutStore(context: Context) : LayoutStore {
 
     private companion object {
         const val FILE_NAME = "layout.json"
-        const val SCHEMA_VERSION = 1
+        const val SCHEMA_VERSION = CURRENT_SCHEMA_VERSION
     }
 }

@@ -185,6 +185,76 @@ class ControllerStoreTest {
     }
 
     @Test
+    fun sevenBitContinuousSendsSingleCcAndAcceptsFeedback() = runTest {
+        val transport = FakeTransport()
+        val store = ControllerStore(transport, InMemoryLayoutStore(), backgroundScope)
+        runCurrent()
+
+        store.upsertControl(
+            Control(
+                id = "",
+                label = "Fader 2",
+                kind = ControlKind.FADER,
+                mapping = androidxMidiMapping(MidiType.CC, 1, 2, 7),
+            )
+        )
+        val id = store.state.value.controls.single().id
+
+        store.setContinuousValue(id, 16383)
+        advanceTimeBy(11)
+        runCurrent()
+
+        val sent = transport.sent.last()
+        assertEquals(1, sent.size)
+        assertEquals(0xB0, sent[0].status)
+        assertEquals(2, sent[0].data1)
+        assertEquals(127, sent[0].data2)
+        // 拖动期间及松手后 200ms 回声窗口内忽略旧的 DAW 回传，避免拉扯滑块；
+        // 窗口结束后正常接受 DAW 反馈。
+        transport.emitIncoming(listOf(MidiMessage.controlChange(1, 2, 32)))
+        runCurrent()
+        assertEquals(16383, store.state.value.controls.single().value)
+
+        advanceTimeBy(200)
+        runCurrent()
+        transport.emitIncoming(listOf(MidiMessage.controlChange(1, 2, 64)))
+        runCurrent()
+        assertEquals(64 shl 7, store.state.value.controls.single().value)
+    }
+
+    @Test
+    fun pitchBendSendsSingleMessageAndAcceptsFeedback() = runTest {
+        val transport = FakeTransport()
+        val store = ControllerStore(transport, InMemoryLayoutStore(), backgroundScope)
+        runCurrent()
+
+        store.upsertControl(
+            Control(
+                id = "",
+                label = "Fader 2",
+                kind = ControlKind.FADER,
+                mapping = androidxMidiMapping(MidiType.PITCH_BEND, 1, 0, 14),
+            )
+        )
+        val id = store.state.value.controls.single().id
+
+        store.setContinuousValue(id, 9000)
+        advanceTimeBy(11)
+        runCurrent()
+
+        val sent = transport.sent.last()
+        assertEquals(1, sent.size)
+        assertEquals(0xE0, sent[0].status)
+        assertEquals(9000 and 0x7F, sent[0].data1)
+        assertEquals(9000 shr 7, sent[0].data2)
+        advanceTimeBy(200)
+        runCurrent()
+        transport.emitIncoming(listOf(MidiMessage(0xE0, 4096 and 0x7F, 4096 shr 7)))
+        runCurrent()
+        assertEquals(4096, store.state.value.controls.single().value)
+    }
+
+    @Test
     fun invalidMappingIsRejectedAndValidLayoutIsSaved() = runTest {
         val transport = FakeTransport()
         val layoutStore = InMemoryLayoutStore()
@@ -214,6 +284,45 @@ class ControllerStoreTest {
         assertNotNull(saved)
         assertEquals(1, saved.layout.controls.size)
         assertEquals("Good", saved.layout.controls.single().label)
+    }
+
+    @Test
+    fun moveControlTakesTargetSlotAndPersists() = runTest {
+        val transport = FakeTransport()
+        val layoutStore = InMemoryLayoutStore()
+        val store = ControllerStore(transport, layoutStore, backgroundScope)
+        runCurrent()
+
+        repeat(3) { index ->
+            assertEquals(
+                null,
+                store.upsertControl(
+                    Control(
+                        id = "",
+                        label = "Pad $index",
+                        kind = ControlKind.BUTTON,
+                        mapping = androidxMidiMapping(MidiType.NOTE, 1, 60 + index, 7),
+                    )
+                )
+            )
+        }
+        val controls = store.state.value.controls
+        val first = controls[0]
+        val second = controls[1]
+        val third = controls[2]
+
+        store.moveControl(third.id, first.id)
+        assertEquals(
+            listOf(third.label, first.label, second.label),
+            store.state.value.controls.map { it.label },
+        )
+
+        advanceTimeBy(301)
+        runCurrent()
+        assertEquals(
+            listOf(third.label, first.label, second.label),
+            layoutStore.saved?.layout?.controls?.map { it.label },
+        )
     }
 
     @Test
@@ -317,6 +426,43 @@ class ControllerStoreTest {
         runCurrent()
         assertEquals(com.remoteesp32midi.glassmidi.ble.ConnectionPhase.READY, store.state.value.connection.phase)
         assertEquals("AA:BB", store.state.value.lastDeviceAddress)
+    }
+
+    @Test
+    fun channelStripsAreInitializedAndCanAddMoveAndDelete() = runTest {
+        val transport = FakeTransport()
+        val store = ControllerStore(transport, InMemoryLayoutStore(), backgroundScope)
+        runCurrent()
+
+        store.ensureDefaultStrips()
+        val initialControls = store.state.value.controls
+        assertEquals(20, initialControls.size)
+        initialControls.forEach { control ->
+            assertEquals(null, validateControl(control, initialControls, control.id))
+        }
+        assertEquals(1, initialControls[0].mapping.channel)
+        assertEquals(MidiType.PITCH_BEND, initialControls[0].mapping.type)
+        assertEquals(MidiResolution.SEVEN_BIT, initialControls[1].mapping.resolution)
+        assertEquals(1, initialControls[1].mapping.number)
+        assertEquals(2, initialControls[5].mapping.channel)
+        assertEquals(MidiType.PITCH_BEND, initialControls[5].mapping.type)
+
+        val newIndex = store.addChannelStrip()
+        assertEquals(4, newIndex)
+        assertEquals(25, store.state.value.controls.size)
+        assertEquals(5, store.state.value.controls[20].mapping.channel)
+
+        val firstFaderId = store.state.value.controls[0].id
+        val secondFaderId = store.state.value.controls[5].id
+        store.moveChannelStrip(0, 1)
+        assertEquals(secondFaderId, store.state.value.controls[0].id)
+        assertEquals(firstFaderId, store.state.value.controls[5].id)
+        // 移动通道条后，位置 0 始终保持预设的 MIDI Channel 1，位置 1 保持 MIDI Channel 2
+        assertEquals(1, store.state.value.controls[0].mapping.channel)
+        assertEquals(2, store.state.value.controls[5].mapping.channel)
+
+        store.deleteChannelStrip(4)
+        assertEquals(20, store.state.value.controls.size)
     }
 
     private fun androidxMidiMapping(

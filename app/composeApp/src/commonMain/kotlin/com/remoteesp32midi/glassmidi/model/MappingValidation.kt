@@ -3,8 +3,9 @@ package com.remoteesp32midi.glassmidi.model
 /**
  * 控件映射校验规则：
  * - Button 允许 Note/CC，且只能是 7-bit；
- * - Knob/Fader 只能是 CC 14-bit，number 范围 0..31（LSB = number + 32）；
+ * - Knob/Fader 可用 CC（7-bit 或 14-bit），或单条 14-bit Pitch Bend；
  * - 同一通道上，14-bit 的 MSB/LSB 不得与任何其他 CC 占用相同编号；
+ * - 同一通道只能有一个 Pitch Bend；
  * - 普通 7-bit CC 之间、Note 之间允许重复映射。
  */
 fun validateControl(
@@ -18,6 +19,9 @@ fun validateControl(
 
     when (candidate.kind) {
         ControlKind.BUTTON -> {
+            if (candidate.mapping.type == MidiType.PITCH_BEND) {
+                return "Button 不支持 Pitch Bend"
+            }
             if (candidate.mapping.resolution != MidiResolution.SEVEN_BIT) {
                 return "Button 不支持 14-bit"
             }
@@ -29,41 +33,73 @@ fun validateControl(
                 MidiType.CC -> if (candidate.mapping.number !in 0..127) {
                     return "CC 编号必须在 0..127"
                 }
+
+                MidiType.PITCH_BEND -> return "Button 不支持 Pitch Bend"
             }
         }
 
         ControlKind.KNOB, ControlKind.FADER -> {
-            if (candidate.mapping.type != MidiType.CC) return "Knob/Fader 只能使用 CC"
-            if (candidate.mapping.resolution != MidiResolution.FOURTEEN_BIT) {
-                return "Knob/Fader 必须是 14-bit CC"
+            when (candidate.mapping.type) {
+                MidiType.NOTE -> return "Knob/Fader 只能使用 CC 或 Pitch Bend"
+                MidiType.PITCH_BEND -> {
+                    if (candidate.mapping.resolution != MidiResolution.FOURTEEN_BIT) {
+                        return "Pitch Bend 固定为 14-bit"
+                    }
+                }
+
+                MidiType.CC -> {
+                    if (candidate.mapping.resolution == MidiResolution.FOURTEEN_BIT) {
+                        if (candidate.mapping.number !in 0..31) return "14-bit CC 编号必须在 0..31"
+                    } else {
+                        if (candidate.mapping.number !in 0..127) return "7-bit CC 编号必须在 0..127"
+                    }
+                }
             }
-            if (candidate.mapping.number !in 0..31) return "14-bit CC 编号必须在 0..31"
         }
     }
 
     val others = allControls.filter { it.id != excludeId }
     val candidateChannel = candidate.mapping.channel
+
+    if (candidate.mapping.type == MidiType.PITCH_BEND) {
+        val occupied = others.firstOrNull {
+            it.mapping.type == MidiType.PITCH_BEND &&
+                it.mapping.channel == candidateChannel
+        }
+        if (occupied != null) {
+            return "通道 $candidateChannel 的 Pitch Bend 已被「${occupied.label}」占用"
+        }
+    }
     val candidateIsFourteenBit =
         candidate.mapping.type == MidiType.CC &&
             candidate.mapping.resolution == MidiResolution.FOURTEEN_BIT
-    val candidateNumbers = if (candidateIsFourteenBit) {
-        setOf(candidate.mapping.number, candidate.mapping.number + 32)
-    } else if (candidate.mapping.type == MidiType.CC && candidate.kind == ControlKind.BUTTON) {
-        setOf(candidate.mapping.number)
-    } else {
+    val candidateNumbers = if (candidate.mapping.type != MidiType.CC) {
         emptySet()
+    } else if (candidateIsFourteenBit) {
+        setOf(candidate.mapping.number, candidate.mapping.number + 32)
+    } else {
+        setOf(candidate.mapping.number)
     }
 
     for (other in others) {
         if (other.mapping.type != MidiType.CC) continue
         if (other.mapping.channel != candidateChannel) continue
-        if (other.kind == ControlKind.KNOB || other.kind == ControlKind.FADER) {
-            val occupied = setOf(other.mapping.number, other.mapping.number + 32)
-            if (candidateNumbers.any { it in occupied }) {
-                return "通道 ${candidateChannel} 的 CC ${other.mapping.number}/${other.mapping.number + 32} 已被「${other.label}」占用"
+        val otherIsFourteenBit = other.mapping.resolution == MidiResolution.FOURTEEN_BIT
+        val otherNumbers = if (otherIsFourteenBit) {
+            setOf(other.mapping.number, other.mapping.number + 32)
+        } else {
+            setOf(other.mapping.number)
+        }
+        // 7-bit 之间允许重复；只要涉及 14-bit 的 MSB/LSB，就不允许占用同一编号。
+        if ((candidateIsFourteenBit || otherIsFourteenBit) &&
+            candidateNumbers.any { it in otherNumbers }
+        ) {
+            val occupied = if (otherIsFourteenBit) {
+                "CC ${other.mapping.number}/${other.mapping.number + 32}"
+            } else {
+                "CC ${other.mapping.number}"
             }
-        } else if (candidateIsFourteenBit && other.mapping.number in candidateNumbers) {
-            return "通道 ${candidateChannel} 的 CC ${other.mapping.number} 已被「${other.label}」占用"
+            return "通道 ${candidateChannel} 的 $occupied 已被「${other.label}」占用"
         }
     }
 
