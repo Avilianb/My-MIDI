@@ -1,5 +1,11 @@
 package com.remoteesp32midi.glassmidi.ui
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import kotlinx.coroutines.delay
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -16,10 +22,14 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.systemBars
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
@@ -80,10 +90,16 @@ fun GlassMidiApp(
     onRequestPermissions: () -> Unit,
     onConnect: (BleDevice) -> Unit,
     onDisconnect: () -> Unit,
+    landscapeDockRevealed: Boolean = false,
+    landscapeDockTick: Int = 0,
+    onLandscapeDockInteraction: () -> Unit = {},
+    onDismissLandscapeDock: () -> Unit = {},
 ) {
     val state by store.state.collectAsState()
     val backdrop = rememberLayerBackdrop()
     var editor by remember { mutableStateOf<Control?>(null) }
+    var editingChannelStrip by remember { mutableStateOf<ChannelStrip?>(null) }
+    var deletingChannelStrip by remember { mutableStateOf<ChannelStrip?>(null) }
     var selectedTab by remember { mutableIntStateOf(0) }
     var selectedBankPage by remember { mutableIntStateOf(0) }
     val activeTab = DockTab.entries[selectedTab.coerceIn(0, DockTab.entries.lastIndex)]
@@ -95,8 +111,21 @@ fun GlassMidiApp(
         }
     }
 
-    val strips = remember(state.controls) { state.controls.toChannelStrips() }
-    Box(Modifier.fillMaxSize()) {
+    val strips = remember(state.controls, state.channelNames) {
+        state.controls.toChannelStrips(state.channelNames)
+    }
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val isLandscape = maxWidth > maxHeight
+        val dockVisible = !isLandscape || landscapeDockRevealed
+        val bottomInset = if (isLandscape) 0.dp else DockBottomInset
+
+        LaunchedEffect(isLandscape, landscapeDockRevealed, selectedTab, landscapeDockTick) {
+            if (isLandscape && landscapeDockRevealed) {
+                delay(3500L)
+                onDismissLandscapeDock()
+            }
+        }
+
         BackgroundLayer(backdrop)
 
         Box(
@@ -105,135 +134,125 @@ fun GlassMidiApp(
             Column(
                 Modifier
                     .fillMaxSize()
-                    .windowInsetsPadding(WindowInsets.safeDrawing)
+                    .windowInsetsPadding(WindowInsets.systemBars.union(WindowInsets.displayCutout))
                     .padding(horizontal = 12.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 when (activeTab) {
                     DockTab.CONTROL, DockTab.CUSTOMIZE -> {
                         val editMode = activeTab == DockTab.CUSTOMIZE
-                        BoxWithConstraints(
+                        val stripsPerPage = 4
+                        val pageCount = ((strips.size + stripsPerPage - 1) / stripsPerPage)
+                            .coerceAtLeast(1)
+                        val currentPage = selectedBankPage.coerceIn(0, pageCount - 1)
+                        LaunchedEffect(currentPage, pageCount) {
+                            if (selectedBankPage != currentPage) {
+                                selectedBankPage = currentPage
+                            }
+                        }
+                        val pageStart = currentPage * stripsPerPage
+                        val pageStrips = strips.drop(pageStart).take(stripsPerPage)
+
+                        Column(
                             Modifier
                                 .weight(1f)
-                                .fillMaxWidth(),
+                                .fillMaxWidth()
+                                .padding(bottom = bottomInset),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            val isLandscape = maxWidth > maxHeight
-                            val stripsPerPage = if (isLandscape) {
-                                (maxWidth / 96.dp).toInt().coerceIn(4, 10)
-                            } else {
-                                4
-                            }
-                            val pageCount = ((strips.size + stripsPerPage - 1) / stripsPerPage)
-                                .coerceAtLeast(1)
-                            val currentPage = selectedBankPage.coerceIn(0, pageCount - 1)
-                            LaunchedEffect(currentPage, pageCount) {
-                                if (selectedBankPage != currentPage) {
-                                    selectedBankPage = currentPage
-                                }
-                            }
-                            val pageStart = currentPage * stripsPerPage
-                            val pageStrips = strips.drop(pageStart).take(stripsPerPage)
-
-                            Column(
+                            Row(
                                 Modifier
-                                    .fillMaxSize()
-                                    .padding(bottom = DockBottomInset),
-                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                                    .weight(1f)
+                                    .fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                MixerTopBar(
-                                    state = state,
-                                    editMode = editMode,
-                                    stripsCount = strips.size,
-                                    stripsPerPage = stripsPerPage,
-                                    pageCount = pageCount,
-                                    currentPage = currentPage,
-                                    backdrop = backdrop,
-                                    onSelectPage = { selectedBankPage = it },
-                                    onAddStrip = {
-                                        val newIndex = store.addChannelStrip()
-                                        selectedBankPage = newIndex / stripsPerPage
-                                    },
-                                    onOpenConnection = {
-                                        selectedTab = DockTab.CONNECTION.ordinal
-                                    },
-                                )
-
-                                GlassSurface(
-                                    backdrop = backdrop,
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .fillMaxWidth(),
-                                    shape = RoundedCornerShape(24.dp),
-                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp),
-                                ) {
-                                    Row(
-                                        Modifier.fillMaxSize(),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                    ) {
-                                        pageStrips.forEachIndexed { idx, strip ->
-                                            if (idx > 0) {
-                                                Box(
-                                                    Modifier
-                                                        .width(0.5.dp)
-                                                        .fillMaxHeight()
-                                                        .padding(vertical = 8.dp)
-                                                        .background(Color.Black.copy(alpha = 0.08f)),
-                                                )
-                                            }
-                                            key(strip.index) {
-                                                ChannelStripCard(
-                                                    strip = strip,
-                                                    totalStrips = strips.size,
-                                                    backdrop = backdrop,
-                                                    editMode = editMode,
-                                                    landscape = isLandscape,
-                                                    onPressStart = { store.buttonDown(it) },
-                                                    onPressEnd = { store.buttonUp(it) },
-                                                    onContinuousChange = { id, value ->
-                                                        store.setContinuousValue(id, value)
-                                                    },
-                                                    onContinuousFinished = { id ->
-                                                        store.flushContinuousValue(id)
-                                                    },
-                                                    onEditControl = { control ->
-                                                        if (editMode) editor = control
-                                                    },
-                                                    onMoveLeft = {
-                                                        if (strip.index > 0) {
-                                                            store.moveChannelStrip(strip.index, strip.index - 1)
-                                                        }
-                                                    },
-                                                    onMoveRight = {
-                                                        if (strip.index < strips.size - 1) {
-                                                            store.moveChannelStrip(strip.index, strip.index + 1)
-                                                        }
-                                                    },
-                                                    onDeleteStrip = {
-                                                        store.deleteChannelStrip(strip.index)
-                                                    },
-                                                    modifier = Modifier
-                                                        .weight(1f)
-                                                        .fillMaxHeight(),
-                                                )
-                                            }
-                                        }
-                                        val emptySlots = (stripsPerPage - pageStrips.size).coerceAtLeast(0)
-                                        repeat(emptySlots) {
+                                    pageStrips.forEachIndexed { idx, strip ->
+                                        if (idx > 0) {
                                             Box(
                                                 Modifier
                                                     .width(0.5.dp)
                                                     .fillMaxHeight()
                                                     .padding(vertical = 8.dp)
-                                                    .background(Color.Black.copy(alpha = 0.05f)),
+                                                    .background(Color.Black.copy(alpha = 0.08f)),
                                             )
-                                            Spacer(
-                                                Modifier
+                                        }
+                                        key(strip.index) {
+                                            ChannelStripCard(
+                                                strip = strip,
+                                                totalStrips = strips.size,
+                                                backdrop = backdrop,
+                                                editMode = editMode,
+                                                landscape = isLandscape,
+                                                onPressStart = {
+                                                    if (isLandscape && landscapeDockRevealed) {
+                                                        onDismissLandscapeDock()
+                                                    }
+                                                    store.buttonDown(it)
+                                                },
+                                                onPressEnd = { store.buttonUp(it) },
+                                                onContinuousChange = { id, value ->
+                                                    if (isLandscape && landscapeDockRevealed) {
+                                                        onDismissLandscapeDock()
+                                                    }
+                                                    store.setContinuousValue(id, value)
+                                                },
+                                                onContinuousFinished = { id ->
+                                                    store.flushContinuousValue(id)
+                                                },
+                                                onEditControl = { control ->
+                                                    if (editMode) editor = control
+                                                },
+                                                onMoveLeft = {
+                                                    if (strip.index > 0) {
+                                                        store.moveChannelStrip(strip.index, strip.index - 1)
+                                                    }
+                                                },
+                                                onMoveRight = {
+                                                    if (strip.index < strips.size - 1) {
+                                                        store.moveChannelStrip(strip.index, strip.index + 1)
+                                                    }
+                                                },
+                                                onDeleteStrip = {
+                                                    if (editMode) deletingChannelStrip = strip
+                                                },
+                                                onRenameStrip = {
+                                                    if (editMode) editingChannelStrip = strip
+                                                },
+                                                modifier = Modifier
                                                     .weight(1f)
                                                     .fillMaxHeight(),
                                             )
                                         }
                                     }
-                                }
+                                    val emptySlots = (stripsPerPage - pageStrips.size).coerceAtLeast(0)
+                                    repeat(emptySlots) {
+                                        Box(
+                                            Modifier
+                                                .width(0.5.dp)
+                                                .fillMaxHeight()
+                                                .padding(vertical = 8.dp)
+                                                .background(Color.Black.copy(alpha = 0.05f)),
+                                        )
+                                        Spacer(
+                                            Modifier
+                                                .weight(1f)
+                                                .fillMaxHeight(),
+                                        )
+                                    }
+                            }
+                            if (pageCount > 1 || editMode) {
+                                MixerPageBar(
+                                    stripsCount = strips.size,
+                                    stripsPerPage = stripsPerPage,
+                                    pageCount = pageCount,
+                                    currentPage = currentPage,
+                                    editMode = editMode,
+                                    onSelectPage = { selectedBankPage = it },
+                                    onAddStrip = {
+                                        val newIndex = store.addChannelStrip()
+                                        selectedBankPage = newIndex / stripsPerPage
+                                    },
+                                )
                             }
                         }
                     }
@@ -253,18 +272,17 @@ fun GlassMidiApp(
                             modifier = Modifier
                                 .weight(1f)
                                 .fillMaxWidth()
-                                .padding(bottom = DockBottomInset),
+                                .padding(bottom = bottomInset),
                         )
                     }
                 }
             }
         }
 
-        LiquidBottomTabs(
-            selectedTabIndex = selectedTab,
-            onTabSelected = { selectedTab = it },
-            backdrop = backdrop,
-            tabsCount = DockTab.entries.size,
+        AnimatedVisibility(
+            visible = dockVisible,
+            enter = slideInVertically { it } + fadeIn(),
+            exit = slideOutVertically { it } + fadeOut(),
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
@@ -272,26 +290,61 @@ fun GlassMidiApp(
                 .padding(horizontal = 32.dp)
                 .padding(bottom = 10.dp),
         ) {
-            DockTab.entries.forEachIndexed { index, tab ->
-                val tabContentColor =
-                    if (index == selectedTab) GlassAccent else bottomContentColor
-                LiquidBottomTab(
-                    selected = index == selectedTab,
-                    onClick = { selectedTab = index },
-                ) {
-                    TabIcon(
-                        tab = tab,
-                        color = tabContentColor,
-                        modifier = Modifier.size(26.dp),
-                    )
-                    BasicText(
-                        tab.label,
-                        style = TextStyle(
-                            color = tabContentColor,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Medium,
-                        ),
-                    )
+            LiquidBottomTabs(
+                selectedTabIndex = selectedTab,
+                onTabSelected = {
+                    selectedTab = it
+                    if (isLandscape) onLandscapeDockInteraction()
+                },
+                backdrop = backdrop,
+                tabsCount = DockTab.entries.size,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                DockTab.entries.forEachIndexed { index, tab ->
+                    val tabContentColor =
+                        if (index == selectedTab) GlassAccent else bottomContentColor
+                    LiquidBottomTab(
+                        selected = index == selectedTab,
+                        onClick = {
+                            selectedTab = index
+                            if (isLandscape) onLandscapeDockInteraction()
+                        },
+                    ) {
+                        Box {
+                            TabIcon(
+                                tab = tab,
+                                color = tabContentColor,
+                                modifier = Modifier.size(26.dp),
+                            )
+                            // 状态只用一个点表示:已连接不显示，其它状态按严重程度着色。
+                            val statusDot = when (state.connection.phase) {
+                                ConnectionPhase.READY -> null
+                                ConnectionPhase.ERROR -> GlassDanger
+                                ConnectionPhase.CONNECTING,
+                                ConnectionPhase.RECONNECTING,
+                                ConnectionPhase.SCANNING -> GlassAccent
+                                ConnectionPhase.IDLE -> GlassMuted
+                            }
+                            if (statusDot != null && tab == DockTab.CONNECTION) {
+                                Box(
+                                    Modifier
+                                        .align(Alignment.TopEnd)
+                                        .offset(x = 1.dp, y = (-1).dp)
+                                        .size(7.dp)
+                                        .clip(CircleShape)
+                                        .background(statusDot),
+                                )
+                            }
+                        }
+                        BasicText(
+                            tab.label,
+                            style = TextStyle(
+                                color = tabContentColor,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Medium,
+                            ),
+                        )
+                    }
                 }
             }
         }
@@ -309,6 +362,30 @@ fun GlassMidiApp(
                 allowKindChange = false,
             )
         }
+
+        editingChannelStrip?.let { strip ->
+            ChannelNameEditor(
+                backdrop = backdrop,
+                stripNumber = strip.number,
+                initialName = strip.customName.orEmpty(),
+                onDismiss = { editingChannelStrip = null },
+                onSave = { newName ->
+                    store.renameChannelStrip(strip.index, newName)
+                },
+            )
+        }
+
+        deletingChannelStrip?.let { strip ->
+            DeleteChannelConfirmDialog(
+                backdrop = backdrop,
+                stripNumber = strip.number,
+                customName = strip.customName,
+                onDismiss = { deletingChannelStrip = null },
+                onConfirm = {
+                    store.deleteChannelStrip(strip.index)
+                },
+            )
+        }
     }
 }
 
@@ -322,87 +399,45 @@ private fun BackgroundLayer(backdrop: LayerBackdrop) {
     )
 }
 
+
 @Composable
-private fun MixerTopBar(
-    state: UiState,
-    editMode: Boolean,
+private fun MixerPageBar(
     stripsCount: Int,
     stripsPerPage: Int,
     pageCount: Int,
     currentPage: Int,
-    backdrop: Backdrop,
+    editMode: Boolean,
     onSelectPage: (Int) -> Unit,
     onAddStrip: () -> Unit,
-    onOpenConnection: () -> Unit,
 ) {
     Row(
         Modifier
             .fillMaxWidth()
-            .height(44.dp),
+            .height(28.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Row(
-            Modifier
-                .clip(RoundedCornerShape(12.dp))
-                .clickable(onClick = onOpenConnection)
-                .padding(vertical = 2.dp, horizontal = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            ConnectionGlyph(
-                connected = state.connection.phase == ConnectionPhase.READY,
-                error = state.connection.phase == ConnectionPhase.ERROR,
-                modifier = Modifier.size(14.dp),
-            )
-            Spacer(Modifier.width(6.dp))
-            Column {
-                BasicText(
-                    if (editMode) "自定义台面" else "调音台",
-                    style = TextStyle(
-                        color = GlassText,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.SemiBold,
-                    ),
-                    maxLines = 1,
-                )
-                BasicText(
-                    if (editMode) {
-                        "点控件改名称 · 共 $stripsCount 通道"
-                    } else {
-                        "${state.connectionTitle()} · ${state.connectionDetail()}"
-                    },
-                    style = TextStyle(GlassMuted, 9.sp),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-
         Row(
             Modifier
                 .weight(1f)
                 .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.End),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            if (pageCount > 1) {
-                for (page in 0 until pageCount) {
-                    val firstCh = page * stripsPerPage + 1
-                    val lastCh = ((page + 1) * stripsPerPage).coerceAtMost(stripsCount)
-                    val label = if (firstCh == lastCh) {
-                        "CH $firstCh"
-                    } else {
-                        "CH $firstCh-$lastCh"
-                    }
-                    BankChip(
-                        text = label,
-                        selected = page == currentPage,
-                        onClick = { onSelectPage(page) },
-                    )
+            for (page in 0 until pageCount) {
+                val firstCh = page * stripsPerPage + 1
+                val lastCh = ((page + 1) * stripsPerPage).coerceAtMost(stripsCount)
+                val label = if (firstCh == lastCh) {
+                    "CH $firstCh"
+                } else {
+                    "CH $firstCh-$lastCh"
                 }
+                BankChip(
+                    text = label,
+                    selected = page == currentPage,
+                    onClick = { onSelectPage(page) },
+                )
             }
         }
-
         if (editMode) {
             BankChip(
                 text = "+ 通道",

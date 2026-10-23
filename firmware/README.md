@@ -232,7 +232,9 @@ USB->BLE sent=0 drop=0; unsupported=0 tx_drop=0 usb_unsupported=0 flushes=14 pan
   - `bit 0`：目标端口（`0` = Port 1 / Cable 0，`1` = Port 2 / Cable 1）。
   - `bit 4`：`0` 表示连接/重连时的自动握手（若目标端口已被另一台正在演出的手机显式占用，固件拒绝抢占并分配空闲端口）；`1` 表示用户在 App 内手动点击切换端口（强制互换）。
   - 每次绑定或变更端口后，固件通过 BLE-MIDI Notify 向手机下发 `[0xF4, 0x7D, actual_cable]` 回执，App 自动同步显示真实分配到的端口。
-- **活跃音符跟踪与 Note Off 补发**：`midi_bridge` 维护每个端口 16 通道 × 128 音符的活跃位图与挂起 Note Off 位图；即使队列或 USB FIFO 瞬时满载，Note Off 也绝不丢失，并在下一循环最优先补发；断连清音时除发送 CC 123/120/64 外，还会逐音补发所有未释放音符的 Note Off。
+- **USB 侧影子状态与连接回放**：`midi_bridge` 缓存每个端口 16 通道 × 128 个 CC 的最后一个值（以及每通道 Pitch Bend）。DAW 的初始化 dump 往往发生在手机还没订阅 Notify 的时刻、会被直接丢弃，因此端口绑定完成（Notify 打开）时按 `(channel, CC)` 升序回放一次，让手机 UI 对齐 DAW 当前参数；14-bit 的 MSB/LSB 天然成对。音符不回放（避免连接前按住的音被意外触发），USB 卸载时清空缓存（DAW 重启后会重新 dump）。约 4.7 KB RAM。
+- **App 连接时不再推值**：握手包之外不再发送本地推子/旋钮值，连接以 DAW 为准。
+- **活跃音符跟踪与 Note Off 补发**：`midi_bridge` 维护每个端口 16 通道 × 128 音符的活跃位图与挂起 Note Off 位图；即使队列或 USB FIFO 瞬时满载，Note Off 也绝不丢失，并在**当前队列排空之后**补发（先排空再补发，避免 Note Off 抢在同音 Note On 之前造成卡音）；断连清音时除发送 CC 123/120/64 外，还会逐音补发所有未释放音符的 Note Off。端口换绑（含强制互换）时，旧端口的音符状态会被清空并就地清音，避免把 Note Off 错发到换绑后的新手机。
 
 ## 已知限制
 

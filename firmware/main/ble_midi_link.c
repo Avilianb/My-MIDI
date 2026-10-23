@@ -57,6 +57,8 @@ typedef struct {
 
 static ble_midi_slot_t s_slots[BLE_MIDI_MAX_PORTS];
 static portMUX_TYPE s_slots_lock = portMUX_INITIALIZER_UNLOCKED;
+/* 每个 cable 的归属代次：换绑时 +1，桥接层据此释放旧手机在该端口上的余音。 */
+static volatile uint32_t s_cable_generation[BLE_MIDI_MAX_PORTS];
 static ble_midi_rx_cb_t s_rx_cb;
 static uint16_t s_midi_chr_val_handle;
 static uint8_t s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
@@ -146,12 +148,15 @@ static void bind_slot_to_cable(int slot_idx, uint8_t desired_cable, bool force_c
     uint8_t other_cable = 0;
     bool other_notify = false;
     bool rejected = false;
+    uint8_t changed_mask = 0;
 
     portENTER_CRITICAL(&s_slots_lock);
     if (!s_slots[slot_idx].connected) {
         portEXIT_CRITICAL(&s_slots_lock);
         return;
     }
+
+    const uint8_t self_old_cable = s_slots[slot_idx].cable_num;
 
     int other_idx = -1;
     for (int i = 0; i < BLE_MIDI_MAX_PORTS; i++) {
@@ -160,6 +165,8 @@ static void bind_slot_to_cable(int slot_idx, uint8_t desired_cable, bool force_c
             break;
         }
     }
+
+    const uint8_t other_old_cable = other_idx >= 0 ? s_slots[other_idx].cable_num : 0;
 
     if (other_idx >= 0 && !force_claim && s_slots[other_idx].explicit_claim) {
         /*
@@ -181,10 +188,24 @@ static void bind_slot_to_cable(int slot_idx, uint8_t desired_cable, bool force_c
         s_slots[slot_idx].explicit_claim = true;
     }
 
+    if (s_slots[slot_idx].cable_num != self_old_cable) {
+        changed_mask |= (uint8_t)((1u << self_old_cable) | (1u << s_slots[slot_idx].cable_num));
+    }
+    if (other_idx >= 0 && s_slots[other_idx].cable_num != other_old_cable) {
+        changed_mask |= (uint8_t)((1u << other_old_cable) | (1u << s_slots[other_idx].cable_num));
+    }
+
     self_handle = s_slots[slot_idx].conn_handle;
     self_cable = s_slots[slot_idx].cable_num;
     self_notify = s_slots[slot_idx].notify_enabled;
     portEXIT_CRITICAL(&s_slots_lock);
+
+    /* 端口归属变化：让桥接层释放该端口上旧手机的余音，避免 Note Off 错发到新手机。 */
+    for (uint8_t c = 0; c < BLE_MIDI_MAX_PORTS; c++) {
+        if (changed_mask & (uint8_t)(1u << c)) {
+            s_cable_generation[c] = s_cable_generation[c] + 1;
+        }
+    }
 
     if (rejected) {
         ESP_LOGW(TAG, "slot=%d handle=%u auto-claim Port %u rejected (in use); assigned Port %u",
@@ -403,7 +424,9 @@ static int gatt_svr_chr_access_midi(uint16_t conn_handle, uint16_t attr_handle,
 
     switch (ctxt->op) {
     case BLE_GATT_ACCESS_OP_READ_CHR:
-        return 0;
+        /* 本特征只用于写入与通知；读操作按 BLE 规范返回协议错误，
+         * 而不是"成功但 0 字节"（那会让客户端拿到空数据却以为成功）。 */
+        return BLE_ATT_ERR_READ_NOT_PERMITTED;
 
     case BLE_GATT_ACCESS_OP_WRITE_CHR: {
         const uint16_t om_len = OS_MBUF_PKTLEN(ctxt->om);
@@ -616,9 +639,12 @@ static int ble_midi_gap_event(struct ble_gap_event *event, void *arg)
                 ESP_LOGI(TAG, "slot=%d handle=%u cable=%u MIDI notify %s",
                          slot_idx, event->subscribe.conn_handle, cable_num,
                          enabled ? "enabled" : "disabled");
-                if (enabled) {
-                    notify_port_assignment(event->subscribe.conn_handle, cable_num);
-                }
+                /*
+                 * 这里不下发端口回执：此刻的 cable 只是连接时的临时默认分配，
+                 * App 会在取得 READY 后立即发送握手包，由 bind_slot_to_cable 回执真实端口。
+                 * 若在此提前回报，App 会把临时端口当成最终结果持久化，
+                 * 一旦随后的握手回执丢失，两边的端口记录就会长期不一致。
+                 */
             }
         }
         return 0;
@@ -733,6 +759,14 @@ bool ble_midi_link_port_ready(uint8_t cable_num)
     return ready;
 }
 
+uint32_t ble_midi_link_cable_generation(uint8_t cable_num)
+{
+    if (cable_num >= BLE_MIDI_MAX_PORTS) {
+        return 0;
+    }
+    return s_cable_generation[cable_num];
+}
+
 esp_err_t ble_midi_link_send(uint8_t cable_num, const uint8_t *const msgs[], const uint8_t lens[], uint16_t count)
 {
     if (msgs == NULL || lens == NULL || count == 0 || count > BLE_MIDI_MAX_BATCH || cable_num >= BLE_MIDI_MAX_PORTS) {
@@ -760,49 +794,56 @@ esp_err_t ble_midi_link_send(uint8_t cable_num, const uint8_t *const msgs[], con
 
     const uint16_t max_payload = (mtu - 3 <= BLE_MIDI_MAX_PKT_SIZE) ? (mtu - 3) : BLE_MIDI_MAX_PKT_SIZE;
     const uint16_t ts13 = (uint16_t)((xTaskGetTickCount() * portTICK_PERIOD_MS) & 0x1FFF);
-
-    uint8_t pkt[BLE_MIDI_MAX_PKT_SIZE];
-    uint16_t pos = 0;
-    pkt[pos++] = (uint8_t)(0x80 | ((ts13 >> 7) & 0x3F));
     const uint8_t ts_low = (uint8_t)(0x80 | (ts13 & 0x7F));
 
+    /*
+     * 一个通知放不下时继续发下一个通知。默认 ATT MTU(23) 只能装 4 条 3 字节消息，
+     * 以前的实现在这里 break 并返回 ESP_OK，后一半消息被静默丢弃。
+     */
     uint16_t sent_msgs = 0;
-    for (uint16_t i = 0; i < count; i++) {
-        const uint8_t mlen = lens[i];
-        if (msgs[i] == NULL || mlen == 0 || mlen > 3) {
-            continue;
+    uint16_t i = 0;
+    while (i < count) {
+        uint8_t pkt[BLE_MIDI_MAX_PKT_SIZE];
+        uint16_t pos = 0;
+        pkt[pos++] = (uint8_t)(0x80 | ((ts13 >> 7) & 0x3F));
+
+        uint16_t in_packet = 0;
+        while (i < count) {
+            const uint8_t mlen = lens[i];
+            if (msgs[i] == NULL || mlen == 0 || mlen > 3) {
+                i++;
+                continue;
+            }
+            if (pos + 1 + mlen > max_payload) {
+                break;
+            }
+            pkt[pos++] = ts_low;
+            memcpy(&pkt[pos], msgs[i], mlen);
+            pos += mlen;
+            in_packet++;
+            i++;
         }
-        if (pos + 1 + mlen > max_payload) {
+
+        if (in_packet == 0) {
+            /* 单条消息都放不下:MTU 异常，剩余消息按丢弃计数。 */
             break;
         }
-        pkt[pos++] = ts_low;
-        memcpy(&pkt[pos], msgs[i], mlen);
-        pos += mlen;
-        sent_msgs++;
-    }
 
-    if (sent_msgs == 0) {
-        s_tx_dropped += count;
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(pkt, pos);
-    if (om == NULL) {
-        s_tx_dropped += count;
-        return ESP_ERR_NO_MEM;
-    }
-
-    const int rc = ble_gatts_notify_custom(conn_handle, s_midi_chr_val_handle, om);
-    if (rc != 0) {
-        s_tx_dropped += count;
-        return ESP_FAIL;
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(pkt, pos);
+        if (om == NULL) {
+            break;
+        }
+        if (ble_gatts_notify_custom(conn_handle, s_midi_chr_val_handle, om) != 0) {
+            break;
+        }
+        sent_msgs = (uint16_t)(sent_msgs + in_packet);
     }
 
     s_tx_sent += sent_msgs;
     if (count > sent_msgs) {
         s_tx_dropped += (uint32_t)(count - sent_msgs);
     }
-    return ESP_OK;
+    return sent_msgs > 0 ? ESP_OK : ESP_FAIL;
 }
 
 void ble_midi_link_get_stats(ble_midi_link_stats_t *out)

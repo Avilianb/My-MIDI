@@ -29,15 +29,18 @@ class AndroidLayoutStore(context: Context) : LayoutStore {
             val root = JSONObject(file.readFully().decodeToString())
             val layoutObject = root.optJSONObject("layout")
             val controls = layoutObject?.optJSONArray("controls")?.toControls().orEmpty()
+            val channelNames = layoutObject?.optJSONArray("channelNames")?.toStrings().orEmpty()
             PersistedState(
                 schemaVersion = root.optInt("schemaVersion", 1),
                 layout = Layout(
                     schemaVersion = layoutObject?.optInt("schemaVersion", 1) ?: 1,
                     controls = controls,
+                    channelNames = channelNames,
                 ),
                 deviceAddress = root.optString("deviceAddress").takeIf { it.isNotBlank() },
                 deviceName = root.optString("deviceName").takeIf { it.isNotBlank() },
                 devicePort = root.optInt("devicePort", 0).coerceIn(0, 1),
+                mappingSchemeVersion = root.optInt("mappingSchemeVersion", 0),
             )
         }.getOrElse { PersistedState() }
     }
@@ -48,10 +51,14 @@ class AndroidLayoutStore(context: Context) : LayoutStore {
             put("deviceAddress", state.deviceAddress ?: "")
             put("deviceName", state.deviceName ?: "")
             put("devicePort", state.devicePort.coerceIn(0, 1))
+            put("mappingSchemeVersion", state.mappingSchemeVersion)
             put(
                 "layout",
                 JSONObject().apply {
                     put("schemaVersion", state.layout.schemaVersion)
+                    put("channelNames", JSONArray().apply {
+                        state.layout.channelNames.forEach { put(it) }
+                    })
                     put("controls", JSONArray().apply {
                         state.layout.controls.forEach { control ->
                             put(
@@ -119,6 +126,14 @@ class AndroidLayoutStore(context: Context) : LayoutStore {
                 buttonBehavior = buttonBehavior,
             )
             result += control
+        }
+        return result
+    }
+
+    private fun JSONArray.toStrings(): List<String> {
+        val result = ArrayList<String>(length())
+        for (index in 0 until length()) {
+            result += optString(index, "")
         }
         return result
     }

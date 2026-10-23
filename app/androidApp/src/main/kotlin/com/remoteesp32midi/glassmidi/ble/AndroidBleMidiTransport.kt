@@ -95,10 +95,11 @@ class AndroidBleMidiTransport(
         scope.launch(writeDispatcher) {
             for (signal in sendSignal) {
                 while (true) {
-                    val packet = prioritySendQueue.tryReceive().getOrNull()
+                    val priorityPacket = prioritySendQueue.tryReceive().getOrNull()
+                    val packet = priorityPacket
                         ?: continuousSendQueue.tryReceive().getOrNull()
                         ?: break
-                    writePacket(packet)
+                    writePacket(packet, priorityPacket != null)
                     // Android 的 GATT 操作一次只能有一个；留出连接间隔给协议栈。
                     delay(WRITE_PACING_MS)
                 }
@@ -247,7 +248,7 @@ class AndroidBleMidiTransport(
                 deviceName = safeDeviceName(device),
             )
         )
-        startConnectWatchdog(address)
+        startConnectWatchdog(address, autoConnect)
         gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             device.connectGatt(context, autoConnect, gattCallback, BluetoothDevice.TRANSPORT_LE)
         } else {
@@ -255,12 +256,14 @@ class AndroidBleMidiTransport(
         }
     }
 
-    private fun startConnectWatchdog(address: String) {
+    private fun startConnectWatchdog(address: String, autoConnect: Boolean) {
         connectTimeoutJob?.cancel()
+        // autoConnect 走的是系统后台扫描，正常也可能超过 10 s；用更长的窗口，避免把正在成功的重连掐掉。
+        val timeoutMs = if (autoConnect) RECONNECT_TIMEOUT_MS else CONNECT_TIMEOUT_MS
         connectTimeoutJob = scope.launch {
-            delay(CONNECT_TIMEOUT_MS)
+            delay(timeoutMs)
             if (lastConnection.phase != ConnectionPhase.READY && !manualDisconnect) {
-                Log.w(TAG, "connect watchdog timeout for $address; scheduling reconnect")
+                Log.w(TAG, "connect watchdog timeout ($timeoutMs ms) for $address; scheduling reconnect")
                 closeGatt()
                 scheduleReconnect()
             }
@@ -312,6 +315,9 @@ class AndroidBleMidiTransport(
                         deviceAddress = gatt.device.address,
                     )
                 )
+                // 物理连接已建立：把看门狗重置为"服务发现"窗口，
+                // 否则 autoConnect 慢到接近超时时，会在 MTU/发现服务过程中被自己掐断。
+                startConnectWatchdog(gatt.device.address, autoConnect = false)
                 runCatching { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) }
                 if (!gatt.requestMtu(MTU_REQUEST)) {
                     gatt.discoverServices()
@@ -454,20 +460,31 @@ class AndroidBleMidiTransport(
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun writePacket(packet: ByteArray) {
+    private suspend fun writePacket(packet: ByteArray, priority: Boolean) {
         val gatt = gatt ?: return
         val characteristic = midiCharacteristic ?: return
         if (lastConnection.phase != ConnectionPhase.READY) return
 
+        // Note / 端口握手比 CC 重要得多：丢一帧 CC 只是参数跳一下，丢一条 Note Off 就是永久卡音。
+        val retries = if (priority) PRIORITY_WRITE_RETRIES else WRITE_RETRIES
+
         writeMutex.withLock {
             var attempt = 0
-            while (attempt < WRITE_RETRIES) {
+            while (attempt < retries) {
+                // 断开/切换中不要对着已关闭的 gatt 空转，也不要弹假的"写入失败"。
+                if (this@AndroidBleMidiTransport.gatt !== gatt ||
+                    lastConnection.phase != ConnectionPhase.READY
+                ) {
+                    return
+                }
                 val accepted = writeCharacteristic(gatt, characteristic, packet)
                 if (accepted) return
                 delay(WRITE_RETRY_DELAY_MS)
                 attempt++
             }
-            publishError("BLE 写入失败")
+            if (lastConnection.phase == ConnectionPhase.READY) {
+                publishError("BLE 写入失败")
+            }
         }
     }
 
@@ -492,7 +509,9 @@ class AndroidBleMidiTransport(
                 @Suppress("DEPRECATION")
                 gatt.writeCharacteristic(characteristic)
             }
-        } catch (error: SecurityException) {
+        } catch (error: Exception) {
+            // 蓝牙栈被回收/句柄已关闭时可能抛 IllegalStateException、DeadObjectException 等，
+            // 只抓 SecurityException 会让唯一的写协程崩溃，之后所有发送永久失效。
             false
         }
     }
@@ -585,10 +604,12 @@ class AndroidBleMidiTransport(
         private const val MTU_REQUEST = 247
         private const val SCAN_TIMEOUT_MS = 10_000L
         private const val CONNECT_TIMEOUT_MS = 10_000L
+        private const val RECONNECT_TIMEOUT_MS = 30_000L
         private const val DEVICE_PUBLISH_INTERVAL_MS = 250L
         private const val WRITE_PACING_MS = 3L
         private const val WRITE_RETRY_DELAY_MS = 4L
         private const val WRITE_RETRIES = 5
+        private const val PRIORITY_WRITE_RETRIES = 25
         private val RECONNECT_DELAYS_MS = longArrayOf(500L, 1_000L, 2_000L, 5_000L)
     }
 }

@@ -26,6 +26,9 @@ esp_err_t ble_midi_link_init(ble_midi_rx_cb_t cb);
 esp_err_t ble_midi_link_start(void);
 bool ble_midi_link_port_ready(uint8_t cable_num);
 
+/** 该 cable 的归属代次；换绑（端口归属手机变化）时递增，桥接层据此释放旧余音。 */
+uint32_t ble_midi_link_cable_generation(uint8_t cable_num);
+
 /** 向指定 cable_num (0..1) 绑定的手机发送最多 8 条完整 MIDI 消息；每条 1..3 字节。 */
 esp_err_t ble_midi_link_send(uint8_t cable_num, const uint8_t *const msgs[], const uint8_t lens[], uint16_t count);
 

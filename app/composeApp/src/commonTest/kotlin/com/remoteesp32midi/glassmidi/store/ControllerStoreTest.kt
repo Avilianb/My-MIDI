@@ -9,6 +9,7 @@ import com.remoteesp32midi.glassmidi.model.Layout
 import com.remoteesp32midi.glassmidi.model.MidiMessage
 import com.remoteesp32midi.glassmidi.model.MidiResolution
 import com.remoteesp32midi.glassmidi.model.MidiType
+import com.remoteesp32midi.glassmidi.model.MAPPING_SCHEME_VERSION
 import com.remoteesp32midi.glassmidi.model.PersistedState
 import com.remoteesp32midi.glassmidi.model.validateControl
 import com.remoteesp32midi.glassmidi.storage.LayoutStore
@@ -326,7 +327,7 @@ class ControllerStoreTest {
     }
 
     @Test
-    fun reconnectClearsButtonStateAndResendsContinuousValues() = runTest {
+    fun reconnectClearsButtonStateWithoutPushingValuesToDaw() = runTest {
         val transport = FakeTransport()
         val store = ControllerStore(transport, InMemoryLayoutStore(), backgroundScope)
         runCurrent()
@@ -374,9 +375,9 @@ class ControllerStoreTest {
             )
         )
         runCurrent()
-        assertTrue(transport.sent.last().size == 2)
-        assertEquals(64, transport.sent.last()[0].data2)
-        assertEquals(0, transport.sent.last()[1].data2)
+        // 重连只握手：不再把本地推子/旋钮值推给 DAW（连接时以 DAW 为准，由固件回放影子状态）。
+        assertEquals(listOf(MidiMessage.portSelect(0, force = false)), transport.sent.last())
+        assertEquals(0, store.state.value.controls.first { it.id == buttonId }.value)
     }
 
     @Test
@@ -436,7 +437,7 @@ class ControllerStoreTest {
 
         store.ensureDefaultStrips()
         val initialControls = store.state.value.controls
-        assertEquals(20, initialControls.size)
+        assertEquals(24, initialControls.size)
         initialControls.forEach { control ->
             assertEquals(null, validateControl(control, initialControls, control.id))
         }
@@ -444,25 +445,25 @@ class ControllerStoreTest {
         assertEquals(MidiType.PITCH_BEND, initialControls[0].mapping.type)
         assertEquals(MidiResolution.SEVEN_BIT, initialControls[1].mapping.resolution)
         assertEquals(1, initialControls[1].mapping.number)
-        assertEquals(2, initialControls[5].mapping.channel)
-        assertEquals(MidiType.PITCH_BEND, initialControls[5].mapping.type)
+        assertEquals(2, initialControls[6].mapping.channel)
+        assertEquals(MidiType.PITCH_BEND, initialControls[6].mapping.type)
 
         val newIndex = store.addChannelStrip()
         assertEquals(4, newIndex)
-        assertEquals(25, store.state.value.controls.size)
-        assertEquals(5, store.state.value.controls[20].mapping.channel)
+        assertEquals(30, store.state.value.controls.size)
+        assertEquals(5, store.state.value.controls[24].mapping.channel)
 
         val firstFaderId = store.state.value.controls[0].id
-        val secondFaderId = store.state.value.controls[5].id
+        val secondFaderId = store.state.value.controls[6].id
         store.moveChannelStrip(0, 1)
         assertEquals(secondFaderId, store.state.value.controls[0].id)
-        assertEquals(firstFaderId, store.state.value.controls[5].id)
+        assertEquals(firstFaderId, store.state.value.controls[6].id)
         // 移动通道条后，位置 0 始终保持预设的 MIDI Channel 1，位置 1 保持 MIDI Channel 2
         assertEquals(1, store.state.value.controls[0].mapping.channel)
-        assertEquals(2, store.state.value.controls[5].mapping.channel)
+        assertEquals(2, store.state.value.controls[6].mapping.channel)
 
         store.deleteChannelStrip(4)
-        assertEquals(20, store.state.value.controls.size)
+        assertEquals(24, store.state.value.controls.size)
     }
 
     @Test
@@ -495,6 +496,180 @@ class ControllerStoreTest {
         store.setDevicePort(0)
         assertEquals(0, store.state.value.devicePort)
         assertTrue(transport.sent.contains(listOf(MidiMessage.portSelect(0, force = true))))
+    }
+
+    @Test
+    fun legacySingleNoteButtonsMigrateToPerStripNotesOnLoad() = runTest {
+        val legacyControls = (0 until 20).map { index ->
+            val slot = index % 5
+            Control(
+                id = "c$index",
+                label = "c$index",
+                kind = when (slot) {
+                    0 -> ControlKind.FADER
+                    4 -> ControlKind.BUTTON
+                    else -> ControlKind.KNOB
+                },
+                mapping = when (slot) {
+                    0 -> androidxMidiMapping(MidiType.CC, index / 5 + 1, 0, 7)
+                    4 -> androidxMidiMapping(MidiType.NOTE, index / 5 + 1, 60, 7)
+                    else -> androidxMidiMapping(MidiType.CC, index / 5 + 1, slot, 7)
+                },
+            )
+        }
+        val layoutStore = InMemoryLayoutStore(
+            PersistedState(layout = Layout(controls = legacyControls), mappingSchemeVersion = 0),
+        )
+        val transport = FakeTransport()
+        val store = ControllerStore(transport, layoutStore, backgroundScope)
+        runCurrent()
+
+        // 旧布局被扩成 6 控件/条：原来的按钮 + 新增的第二个按钮。
+        assertEquals(24, store.state.value.controls.size)
+        val buttons = store.state.value.controls.filter { it.kind == ControlKind.BUTTON }
+        assertEquals(
+            listOf(36, 37, 38, 39, 40, 41, 42, 43),
+            buttons.map { it.mapping.number },
+        )
+
+        // 迁移后按下第一个按钮，线上实际发出的是 0x90 0x24(C1) 0x7F，不再是 0x3C。
+        store.buttonDown(buttons[0].id)
+        val pressed = transport.sent.last().single()
+        assertEquals(0x90, pressed.status)
+        assertEquals(36, pressed.data1)
+
+        advanceTimeBy(400)
+        runCurrent()
+        assertEquals(MAPPING_SCHEME_VERSION, layoutStore.saved?.mappingSchemeVersion)
+    }
+
+    @Test
+    fun ensureDefaultStripsKeepsManuallySetNoteNumber() = runTest {
+        val store = ControllerStore(FakeTransport(), InMemoryLayoutStore(), backgroundScope)
+        runCurrent()
+
+        store.ensureDefaultStrips()
+        runCurrent()
+        val button = store.state.value.controls[4]
+        assertEquals(36, button.mapping.number)
+
+        assertEquals(
+            null,
+            store.upsertControl(button.copy(mapping = button.mapping.copy(number = 72))),
+        )
+        runCurrent()
+
+        store.ensureDefaultStrips()
+        runCurrent()
+        assertEquals(72, store.state.value.controls[4].mapping.number)
+    }
+
+
+    @Test
+    fun legacyButtonCcMigratesAndSendsNewCcNumber() = runTest {
+        val legacyControls = (0 until 10).map { index ->
+            val slot = index % 5
+            Control(
+                id = "c$index",
+                label = "c$index",
+                kind = when (slot) {
+                    0 -> ControlKind.FADER
+                    4 -> ControlKind.BUTTON
+                    else -> ControlKind.KNOB
+                },
+                mapping = when (slot) {
+                    0 -> androidxMidiMapping(MidiType.CC, index / 5 + 1, 0, 7)
+                    4 -> androidxMidiMapping(MidiType.CC, index / 5 + 1, 64, 7)
+                    else -> androidxMidiMapping(MidiType.CC, index / 5 + 1, slot, 7)
+                },
+            )
+        }
+        val transport = FakeTransport()
+        val layoutStore = InMemoryLayoutStore(
+            PersistedState(layout = Layout(controls = legacyControls), mappingSchemeVersion = 0),
+        )
+        val store = ControllerStore(transport, layoutStore, backgroundScope)
+        runCurrent()
+
+        val buttons = store.state.value.controls.filter { it.kind == ControlKind.BUTTON }
+        assertEquals(listOf(80, 81, 82, 83), buttons.map { it.mapping.number })
+
+        // 迁移后按下第一个按钮，线上发出 CC 80 = 127，不再撞在 CC 64(Sustain) 上。
+        store.buttonDown(buttons[0].id)
+        val pressed = transport.sent.last().single()
+        assertEquals(0xB0, pressed.status)
+        assertEquals(80, pressed.data1)
+        assertEquals(127, pressed.data2)
+    }
+
+
+    @Test
+    fun ensureDefaultStripsKeepsManuallySetCcNumber() = runTest {
+        val store = ControllerStore(FakeTransport(), InMemoryLayoutStore(), backgroundScope)
+        runCurrent()
+
+        store.ensureDefaultStrips()
+        runCurrent()
+        val knob = store.state.value.controls[1]
+        assertEquals(1, knob.mapping.number)
+
+        assertEquals(
+            null,
+            store.upsertControl(knob.copy(mapping = knob.mapping.copy(number = 22))),
+        )
+        runCurrent()
+
+        store.ensureDefaultStrips()
+        runCurrent()
+        assertEquals(22, store.state.value.controls[1].mapping.number)
+    }
+
+
+    @Test
+    fun readySendsOnlyPortHandshakeSoDawKeepsItsOwnState() = runTest {
+        val transport = FakeTransport()
+        val store = ControllerStore(transport, InMemoryLayoutStore(), backgroundScope)
+        runCurrent()
+        store.ensureDefaultStrips()
+        runCurrent()
+        transport.sent.clear()
+
+        transport.emit(
+            TransportEvent.ConnectionChanged(
+                com.remoteesp32midi.glassmidi.ble.BleConnection(
+                    phase = com.remoteesp32midi.glassmidi.ble.ConnectionPhase.READY,
+                )
+            )
+        )
+        runCurrent()
+
+        // 连接时只发端口握手；推子/旋钮的值不再推给 DAW，避免覆盖 DAW 当前参数。
+        assertEquals(1, transport.sent.size)
+        assertEquals(listOf(MidiMessage.portSelect(0, force = false)), transport.sent.single())
+    }
+
+
+    @Test
+    fun trimmingStripsDoesNotWipeCustomNumbers() = runTest {
+        val store = ControllerStore(FakeTransport(), InMemoryLayoutStore(), backgroundScope)
+        runCurrent()
+        store.ensureDefaultStrips()
+        runCurrent()
+
+        val button = store.state.value.controls[4]
+        assertEquals(
+            null,
+            store.upsertControl(button.copy(mapping = button.mapping.copy(number = 72))),
+        )
+        runCurrent()
+
+        store.deleteChannelStrip(3)
+        runCurrent()
+        assertEquals(3, store.state.value.controls.size / 6)
+
+        store.ensureDefaultStrips()
+        runCurrent()
+        assertEquals(72, store.state.value.controls.first { it.id == button.id }.mapping.number)
     }
 
     private fun androidxMidiMapping(

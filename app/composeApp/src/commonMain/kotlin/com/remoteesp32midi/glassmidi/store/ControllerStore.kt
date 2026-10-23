@@ -6,6 +6,7 @@ import com.remoteesp32midi.glassmidi.ble.BleMidiTransport
 import com.remoteesp32midi.glassmidi.ble.ConnectionPhase
 import com.remoteesp32midi.glassmidi.ble.TransportEvent
 import com.remoteesp32midi.glassmidi.model.CONTROLS_PER_STRIP
+import com.remoteesp32midi.glassmidi.model.LEGACY_CONTROLS_PER_STRIP
 import com.remoteesp32midi.glassmidi.model.ButtonBehavior
 import com.remoteesp32midi.glassmidi.model.CURRENT_SCHEMA_VERSION
 import com.remoteesp32midi.glassmidi.model.Control
@@ -16,10 +17,14 @@ import com.remoteesp32midi.glassmidi.model.MidiMapping
 import com.remoteesp32midi.glassmidi.model.MidiMessage
 import com.remoteesp32midi.glassmidi.model.MidiResolution
 import com.remoteesp32midi.glassmidi.model.MidiType
+import com.remoteesp32midi.glassmidi.model.MAPPING_SCHEME_VERSION
 import com.remoteesp32midi.glassmidi.model.PersistedState
+import com.remoteesp32midi.glassmidi.model.migrateLegacyAutoMappings
 import com.remoteesp32midi.glassmidi.model.isChannelStripLayout
+import com.remoteesp32midi.glassmidi.model.isLegacyFiveControlStripLayout
 import com.remoteesp32midi.glassmidi.model.hasPresetStripMappings
 import com.remoteesp32midi.glassmidi.model.presetStripMapping
+import com.remoteesp32midi.glassmidi.model.presetStripCcNumber
 import com.remoteesp32midi.glassmidi.model.presetStripSlotDefaultLabel
 import com.remoteesp32midi.glassmidi.model.validateControl
 import com.remoteesp32midi.glassmidi.model.valueRange
@@ -38,6 +43,7 @@ import kotlin.random.Random
 
 data class UiState(
     val controls: List<Control> = emptyList(),
+    val channelNames: List<String> = emptyList(),
     val connection: BleConnection = BleConnection(),
     val devices: List<BleDevice> = emptyList(),
     val scanning: Boolean = false,
@@ -72,21 +78,30 @@ class ControllerStore(
             val resetToDefaultModes = persisted.schemaVersion < CURRENT_SCHEMA_VERSION ||
                 persisted.layout.schemaVersion < CURRENT_SCHEMA_VERSION
             val migrated = migrateLoadedControls(rawControls)
-            val controls = if (resetToDefaultModes && migrated.isChannelStripLayout()) {
-                applyPresetMappings(migrated, preserveMode = false)
+            val mappingSchemeOutdated = persisted.mappingSchemeVersion < MAPPING_SCHEME_VERSION
+            val migratedMappings = if (mappingSchemeOutdated) {
+                migrateLegacyAutoMappings(expandLegacyStripLayout(migrated))
             } else {
                 migrated
             }
+            val controls = if (resetToDefaultModes && migratedMappings.isChannelStripLayout()) {
+                applyPresetMappings(migratedMappings, preserveMode = false)
+            } else {
+                migratedMappings
+            }
+            val stripCount = controls.size / CONTROLS_PER_STRIP
+            val channelNames = normalizeChannelNames(persisted.layout.channelNames, stripCount)
             _state.update {
                 it.copy(
                     controls = controls,
+                    channelNames = channelNames,
                     lastDeviceAddress = persisted.deviceAddress,
                     lastDeviceName = persisted.deviceName,
                     devicePort = persisted.devicePort.coerceIn(0, 1),
                     loaded = true,
                 )
             }
-            if (controls != rawControls || resetToDefaultModes) {
+            if (controls != rawControls || resetToDefaultModes || mappingSchemeOutdated) {
                 scheduleSave()
             }
         }
@@ -118,11 +133,10 @@ class ControllerStore(
                             )
                         }
                         if (connection.phase == ConnectionPhase.READY) {
-                            // 先向 ESP32 发送本机所属乐手端口自动握手包（force=false，不抢占正在演出的另一台手机）。
+                            // 只发端口握手（force=false，不抢占另一台手机）。
+                            // 不再把本地保存的推子/旋钮值推给 DAW：连接时以 DAW 为准，
+                            // 由固件在端口绑定时回放它缓存的 USB 侧最近状态（见 midi_bridge 影子缓存）。
                             transport.send(listOf(MidiMessage.portSelect(_state.value.devicePort, force = false)))
-                            _state.value.controls
-                                .filter { it.kind != ControlKind.BUTTON }
-                                .forEach { sendContinuous(it, it.value) }
                         } else {
                             pendingContinuous.value = emptyMap()
                             pendingFourteenBit.clear()
@@ -291,7 +305,14 @@ class ControllerStore(
 
         if (current.isChannelStripLayout() && current.size >= minStrips * CONTROLS_PER_STRIP) {
             val normalized = applyPresetMappings(current)
-            _state.update { it.copy(controls = normalized, error = null) }
+            val stripCount = normalized.size / CONTROLS_PER_STRIP
+            _state.update {
+                it.copy(
+                    controls = normalized,
+                    channelNames = normalizeChannelNames(it.channelNames, stripCount),
+                    error = null,
+                )
+            }
             scheduleSave()
             return
         }
@@ -302,7 +323,7 @@ class ControllerStore(
         val neededByExisting = maxOf(
             faders.size,
             (knobs.size + 2) / 3,
-            buttons.size,
+            (buttons.size + 1) / 2,
         )
         val stripCount = maxOf(minStrips, neededByExisting)
         val built = ArrayList<Control>(stripCount * CONTROLS_PER_STRIP)
@@ -314,12 +335,20 @@ class ControllerStore(
                 built += knobs.removeFirstOrNull()
                     ?: createPresetStripControl(stripIdx, slotIdx)
             }
-            built += buttons.removeFirstOrNull()
-                ?: createPresetStripControl(stripIdx, 4)
+            for (slotIdx in 4..5) {
+                built += buttons.removeFirstOrNull()
+                    ?: createPresetStripControl(stripIdx, slotIdx)
+            }
         }
 
-        val normalized = applyPresetMappings(built, preserveMode = false)
-        _state.update { it.copy(controls = normalized, error = null) }
+        val normalized = applyPresetMappings(built, preserveMode = true)
+        _state.update {
+            it.copy(
+                controls = normalized,
+                channelNames = normalizeChannelNames(it.channelNames, stripCount),
+                error = null,
+            )
+        }
         scheduleSave()
     }
 
@@ -333,7 +362,12 @@ class ControllerStore(
                 built += createPresetStripControl(stripIndex, slotIdx)
             }
             newStripIndex = stripIndex
-            current.copy(controls = applyPresetMappings(built), error = null)
+            val updatedControls = applyPresetMappings(built)
+            val updatedNames = normalizeChannelNames(
+                current.channelNames,
+                updatedControls.size / CONTROLS_PER_STRIP,
+            )
+            current.copy(controls = updatedControls, channelNames = updatedNames, error = null)
         }
         scheduleSave()
         return newStripIndex
@@ -350,7 +384,14 @@ class ControllerStore(
             val updated = current.controls.toMutableList().apply {
                 subList(start, end).clear()
             }
-            current.copy(controls = applyPresetMappings(updated), error = null)
+            val updatedNames = normalizeChannelNames(current.channelNames, stripCount)
+                .toMutableList()
+                .apply { removeAt(stripIndex) }
+            current.copy(
+                controls = applyPresetMappings(updated),
+                channelNames = updatedNames,
+                error = null,
+            )
         }
         if (removedIds.isNotEmpty()) {
             pendingContinuous.update { it - removedIds.toSet() }
@@ -370,11 +411,41 @@ class ControllerStore(
             val chunks = current.controls.chunked(CONTROLS_PER_STRIP).toMutableList()
             val strip = chunks.removeAt(fromStripIndex)
             chunks.add(toStripIndex, strip)
+            val updatedNames = normalizeChannelNames(current.channelNames, stripCount)
+                .toMutableList()
+                .apply {
+                    val name = removeAt(fromStripIndex)
+                    add(toStripIndex, name)
+                }
             moved = true
-            current.copy(controls = applyPresetMappings(chunks.flatten()), error = null)
+            current.copy(
+                controls = applyPresetMappings(chunks.flatten()),
+                channelNames = updatedNames,
+                error = null,
+            )
         }
         if (moved) scheduleSave()
     }
+
+    fun renameChannelStrip(stripIndex: Int, name: String) {
+        var changed = false
+        _state.update { current ->
+            val stripCount = current.controls.size / CONTROLS_PER_STRIP
+            if (stripIndex !in 0 until stripCount) return@update current
+            val trimmed = name.trim()
+            val defaultTitle = "CH ${stripIndex + 1}"
+            val normalizedName = if (trimmed.equals(defaultTitle, ignoreCase = true)) "" else trimmed
+            val names = normalizeChannelNames(current.channelNames, stripCount).toMutableList()
+            if (names[stripIndex] == normalizedName) return@update current
+            names[stripIndex] = normalizedName
+            changed = true
+            current.copy(channelNames = names, error = null)
+        }
+        if (changed) scheduleSave()
+    }
+
+    private fun normalizeChannelNames(names: List<String>, stripCount: Int): List<String> =
+        List(stripCount.coerceAtLeast(0)) { idx -> names.getOrNull(idx)?.trim().orEmpty() }
 
     private fun createPresetStripControl(
         stripIndex: Int,
@@ -392,6 +463,33 @@ class ControllerStore(
             mapping = presetStripMapping(stripIndex, slotIndex),
             value = 0,
         )
+    }
+
+    /** 把"每条 5 控件"的旧布局扩成"每条 6 控件"(补第二个按钮)。 */
+    private fun expandLegacyStripLayout(controls: List<Control>): List<Control> {
+        if (!controls.isLegacyFiveControlStripLayout()) return controls
+        val expanded = ArrayList<Control>(
+            controls.size / LEGACY_CONTROLS_PER_STRIP * CONTROLS_PER_STRIP,
+        )
+        controls.chunked(LEGACY_CONTROLS_PER_STRIP).forEachIndexed { stripIdx, chunk ->
+            expanded += chunk
+            // 第二个按钮跟随原按钮的信号类型：原来是 CC 就用新的 CC 编号，否则用新的音高。
+            val template = chunk[4].mapping
+            val second = createPresetStripControl(stripIdx, 5)
+            expanded += if (template.type == MidiType.CC) {
+                second.copy(
+                    mapping = MidiMapping(
+                        type = MidiType.CC,
+                        channel = template.channel,
+                        number = presetStripCcNumber(stripIdx, 5),
+                        resolution = MidiResolution.SEVEN_BIT,
+                    ),
+                )
+            } else {
+                second
+            }
+        }
+        return expanded
     }
 
     private fun applyPresetMappings(
@@ -546,6 +644,7 @@ class ControllerStore(
                 if (_state.value.devicePort != assignedPort) {
                     _state.update { it.copy(devicePort = assignedPort) }
                     changed = true
+                    // 端口变了也不推值：新端口以 DAW 为准，固件会在绑定后回放该端口的影子状态。
                 }
                 continue
             }
@@ -733,13 +832,22 @@ class ControllerStore(
 
     private suspend fun persist() {
         val current = _state.value
+        // 磁盘读取还没完成时落盘会把布局写成空列表（还可能把迁移标记写成已完成）。
+        if (!current.loaded) return
         runCatching {
             layoutStore.save(
                 PersistedState(
-                    layout = Layout(controls = current.controls),
+                    layout = Layout(
+                        controls = current.controls,
+                        channelNames = normalizeChannelNames(
+                            current.channelNames,
+                            current.controls.size / CONTROLS_PER_STRIP,
+                        ),
+                    ),
                     deviceAddress = current.lastDeviceAddress,
                     deviceName = current.lastDeviceName,
                     devicePort = current.devicePort,
+                    mappingSchemeVersion = MAPPING_SCHEME_VERSION,
                 )
             )
         }

@@ -17,18 +17,23 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.layout
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
@@ -206,27 +211,32 @@ fun VerticalLiquidSlider(
     val accentColor = GlassAccent
     val trackColor = Color(0xFF787880).copy(0.22f)
     val trackBackdrop = rememberLayerBackdrop()
+    var trackHeight by remember { mutableIntStateOf(0) }
+    val animationScope = rememberCoroutineScope()
+    val currentValue by rememberUpdatedState(value)
+    val dampedDragAnimation = remember(animationScope) {
+        DampedDragAnimation(
+            animationScope = animationScope,
+            initialValue = value(),
+            valueRange = valueRange,
+            visibilityThreshold = visibilityThreshold,
+            initialScale = 1f,
+            pressedScale = 1.45f,
+            onDragStarted = {},
+            onDragStopped = {},
+            onDrag = { _, _ -> },
+        )
+    }
+    val showLiquidLens by remember {
+        derivedStateOf { dampedDragAnimation.pressProgress > 0.001f }
+    }
 
-    BoxWithConstraints(
-        modifier.fillMaxHeight(),
+    Box(
+        modifier
+            .fillMaxHeight()
+            .onSizeChanged { trackHeight = it.height },
         contentAlignment = Alignment.TopCenter,
     ) {
-        val trackHeight = constraints.maxHeight
-        val animationScope = rememberCoroutineScope()
-        val currentValue by rememberUpdatedState(value)
-        val dampedDragAnimation = remember(animationScope) {
-            DampedDragAnimation(
-                animationScope = animationScope,
-                initialValue = value(),
-                valueRange = valueRange,
-                visibilityThreshold = visibilityThreshold,
-                initialScale = 1f,
-                pressedScale = 1.45f,
-                onDragStarted = {},
-                onDragStopped = {},
-                onDrag = { _, _ -> },
-            )
-        }
         LaunchedEffect(dampedDragAnimation) {
             snapshotFlow { currentValue() }
                 .collectLatest { target ->
@@ -244,10 +254,13 @@ fun VerticalLiquidSlider(
             }
         }
 
+        val trackModifier = if (showLiquidLens) {
+            Modifier.fillMaxHeight().layerBackdrop(trackBackdrop)
+        } else {
+            Modifier.fillMaxHeight()
+        }
         Box(
-            Modifier
-                .fillMaxHeight()
-                .layerBackdrop(trackBackdrop),
+            trackModifier,
             contentAlignment = Alignment.BottomCenter,
         ) {
             Box(
@@ -273,69 +286,83 @@ fun VerticalLiquidSlider(
             )
         }
 
-        Box(
-            Modifier
-                .graphicsLayer {
-                    val yFromTop = trackHeight * (1f - dampedDragAnimation.progress)
-                    translationY = (-size.height / 2f + yFromTop)
-                        .fastCoerceIn(-size.height / 4f, trackHeight - size.height * 3f / 4f)
-                }
-                .drawBackdrop(
-                    backdrop = rememberCombinedBackdrop(
-                        backdrop,
-                        rememberBackdrop(trackBackdrop) { drawBackdrop ->
+        val thumbPositionModifier = Modifier.graphicsLayer {
+            val yFromTop = trackHeight * (1f - dampedDragAnimation.progress)
+            translationY = (-size.height / 2f + yFromTop)
+                .fastCoerceIn(-size.height / 4f, (trackHeight - size.height * 3f / 4f).coerceAtLeast(0f))
+        }
+        if (showLiquidLens) {
+            Box(
+                thumbPositionModifier
+                    .drawBackdrop(
+                        backdrop = rememberCombinedBackdrop(
+                            backdrop,
+                            rememberBackdrop(trackBackdrop) { drawBackdrop ->
+                                val progress = dampedDragAnimation.pressProgress
+                                val scaleX = lerp(0f, 1f, progress)
+                                val scaleY = lerp(2f / 3f, 1f, progress)
+                                scale(scaleX, scaleY) {
+                                    drawBackdrop()
+                                }
+                            },
+                        ),
+                        shape = { Capsule() },
+                        effects = {
                             val progress = dampedDragAnimation.pressProgress
-                            val scaleX = lerp(0f, 1f, progress)
-                            val scaleY = lerp(2f / 3f, 1f, progress)
-                            scale(scaleX, scaleY) {
-                                drawBackdrop()
-                            }
+                            blur(8f.dp.toPx() * (1f - progress))
+                            lens(
+                                10f.dp.toPx() * progress,
+                                14f.dp.toPx() * progress,
+                                chromaticAberration = true,
+                            )
                         },
-                    ),
-                    shape = { Capsule() },
-                    effects = {
-                        val progress = dampedDragAnimation.pressProgress
-                        blur(8f.dp.toPx() * (1f - progress))
-                        lens(
-                            10f.dp.toPx() * progress,
-                            14f.dp.toPx() * progress,
-                            chromaticAberration = true,
-                        )
-                    },
-                    highlight = {
-                        val progress = dampedDragAnimation.pressProgress
-                        Highlight.Ambient.copy(
-                            width = Highlight.Ambient.width / 1.5f,
-                            blurRadius = Highlight.Ambient.blurRadius / 1.5f,
-                            alpha = progress,
-                        )
-                    },
-                    shadow = {
-                        Shadow(
-                            radius = 4f.dp,
-                            color = Color.Black.copy(alpha = 0.14f),
-                        )
-                    },
-                    innerShadow = {
-                        val progress = dampedDragAnimation.pressProgress
-                        InnerShadow(
-                            radius = 4f.dp * progress,
-                            alpha = progress,
-                        )
-                    },
-                    layerBlock = {
-                        scaleX = dampedDragAnimation.scaleX
-                        scaleY = dampedDragAnimation.scaleY
-                        val velocity = dampedDragAnimation.velocity / 10f
-                        scaleY /= 1f - (velocity * 0.75f).fastCoerceIn(-0.2f, 0.2f)
-                        scaleX *= 1f - (velocity * 0.25f).fastCoerceIn(-0.2f, 0.2f)
-                    },
-                    onDrawSurface = {
-                        val progress = dampedDragAnimation.pressProgress
-                        drawRect(Color.White.copy(alpha = 1f - progress))
-                    },
-                )
-                .size(34f.dp, 22f.dp),
-        )
+                        highlight = {
+                            val progress = dampedDragAnimation.pressProgress
+                            Highlight.Ambient.copy(
+                                width = Highlight.Ambient.width / 1.5f,
+                                blurRadius = Highlight.Ambient.blurRadius / 1.5f,
+                                alpha = progress,
+                            )
+                        },
+                        shadow = {
+                            Shadow(
+                                radius = 4f.dp,
+                                color = Color.Black.copy(alpha = 0.14f),
+                            )
+                        },
+                        innerShadow = {
+                            val progress = dampedDragAnimation.pressProgress
+                            InnerShadow(
+                                radius = 4f.dp * progress,
+                                alpha = progress,
+                            )
+                        },
+                        layerBlock = {
+                            scaleX = dampedDragAnimation.scaleX
+                            scaleY = dampedDragAnimation.scaleY
+                            val velocity = dampedDragAnimation.velocity / 10f
+                            scaleY /= 1f - (velocity * 0.75f).fastCoerceIn(-0.2f, 0.2f)
+                            scaleX *= 1f - (velocity * 0.25f).fastCoerceIn(-0.2f, 0.2f)
+                        },
+                        onDrawSurface = {
+                            val progress = dampedDragAnimation.pressProgress
+                            drawRect(Color.White.copy(alpha = 1f - progress))
+                        },
+                    )
+                    .size(34f.dp, 22f.dp),
+            )
+        } else {
+            Box(
+                thumbPositionModifier
+                    .shadow(
+                        elevation = 4.dp,
+                        shape = Capsule(),
+                        ambientColor = Color.Black.copy(alpha = 0.22f),
+                        spotColor = Color.Black.copy(alpha = 0.22f),
+                    )
+                    .background(Color.White, Capsule())
+                    .size(34f.dp, 22f.dp),
+            )
+        }
     }
 }

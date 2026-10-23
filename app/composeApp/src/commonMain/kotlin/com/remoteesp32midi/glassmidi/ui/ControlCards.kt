@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -731,6 +732,7 @@ fun ChannelStripCard(
     onMoveLeft: () -> Unit,
     onMoveRight: () -> Unit,
     onDeleteStrip: () -> Unit,
+    onRenameStrip: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -746,6 +748,7 @@ fun ChannelStripCard(
             onMoveLeft = onMoveLeft,
             onMoveRight = onMoveRight,
             onDeleteStrip = onDeleteStrip,
+            onRenameStrip = onRenameStrip,
         )
 
         if (landscape) {
@@ -753,57 +756,66 @@ fun ChannelStripCard(
                 Modifier
                     .weight(1f)
                     .fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
+                StripVerticalFaderSlot(
+                    control = strip.fader,
+                    backdrop = backdrop,
+                    editMode = editMode,
+                    onValueChange = { onContinuousChange(strip.fader.id, it) },
+                    onFinished = { onContinuousFinished(strip.fader.id) },
+                    onEdit = { onEditControl(strip.fader) },
+                    modifier = Modifier
+                        .weight(0.38f)
+                        .fillMaxHeight(),
+                )
                 Column(
                     Modifier
-                        .weight(0.44f)
+                        .weight(0.62f)
                         .fillMaxHeight(),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    StripVerticalFaderSlot(
-                        control = strip.fader,
-                        backdrop = backdrop,
-                        editMode = editMode,
-                        onValueChange = { onContinuousChange(strip.fader.id, it) },
-                        onFinished = { onContinuousFinished(strip.fader.id) },
-                        onEdit = { onEditControl(strip.fader) },
-                        modifier = Modifier
-                            .weight(1f)
+                    Column(
+                        Modifier
+                            .weight(0.64f)
                             .fillMaxWidth(),
-                    )
-                    StripLiquidButtonSlot(
-                        control = strip.button,
-                        fallbackTitle = "Btn",
-                        backdrop = backdrop,
-                        editMode = editMode,
-                        onPressStart = { onPressStart(strip.button.id) },
-                        onPressEnd = { onPressEnd(strip.button.id) },
-                        onEdit = { onEditControl(strip.button) },
-                        modifier = Modifier
-                            .height(30.dp)
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        strip.knobs.forEachIndexed { idx, knob ->
+                            StripKnobSlot(
+                                control = knob,
+                                fallbackTitle = "K${idx + 1}",
+                                backdrop = backdrop,
+                                editMode = editMode,
+                                onValueChange = { onContinuousChange(knob.id, it) },
+                                onFinished = { onContinuousFinished(knob.id) },
+                                onEdit = { onEditControl(knob) },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxWidth(),
+                            )
+                        }
+                    }
+                    Column(
+                        Modifier
+                            .weight(0.36f)
                             .fillMaxWidth(),
-                    )
-                }
-                Column(
-                    Modifier
-                        .weight(0.56f)
-                        .fillMaxHeight(),
-                    verticalArrangement = Arrangement.spacedBy(2.dp),
-                ) {
-                    strip.knobs.forEachIndexed { idx, knob ->
-                        StripKnobSlot(
-                            control = knob,
-                            fallbackTitle = "K${idx + 1}",
-                            backdrop = backdrop,
-                            editMode = editMode,
-                            onValueChange = { onContinuousChange(knob.id, it) },
-                            onFinished = { onContinuousFinished(knob.id) },
-                            onEdit = { onEditControl(knob) },
-                            modifier = Modifier
-                                .weight(1f)
-                                .fillMaxWidth(),
-                        )
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        strip.buttons.forEachIndexed { idx, button ->
+                            StripLiquidButtonSlot(
+                                control = button,
+                                fallbackTitle = "B${idx + 1}",
+                                backdrop = backdrop,
+                                editMode = editMode,
+                                onPressStart = { onPressStart(button.id) },
+                                onPressEnd = { onPressEnd(button.id) },
+                                onEdit = { onEditControl(button) },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxWidth(),
+                            )
+                        }
                     }
                 }
             }
@@ -816,14 +828,14 @@ fun ChannelStripCard(
                 onFinished = { onContinuousFinished(strip.fader.id) },
                 onEdit = { onEditControl(strip.fader) },
                 modifier = Modifier
-                    .weight(0.48f)
+                    .weight(0.42f)
                     .fillMaxWidth(),
             )
             Column(
                 Modifier
-                    .weight(0.42f)
+                    .weight(0.39f)
                     .fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(2.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 strip.knobs.forEachIndexed { idx, knob ->
                     StripKnobSlot(
@@ -840,18 +852,27 @@ fun ChannelStripCard(
                     )
                 }
             }
-            StripLiquidButtonSlot(
-                control = strip.button,
-                fallbackTitle = "Btn",
-                backdrop = backdrop,
-                editMode = editMode,
-                onPressStart = { onPressStart(strip.button.id) },
-                onPressEnd = { onPressEnd(strip.button.id) },
-                onEdit = { onEditControl(strip.button) },
-                modifier = Modifier
-                    .height(32.dp)
+            Column(
+                Modifier
+                    .weight(0.19f)
                     .fillMaxWidth(),
-            )
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                strip.buttons.forEachIndexed { idx, button ->
+                    StripLiquidButtonSlot(
+                        control = button,
+                        fallbackTitle = "B${idx + 1}",
+                        backdrop = backdrop,
+                        editMode = editMode,
+                        onPressStart = { onPressStart(button.id) },
+                        onPressEnd = { onPressEnd(button.id) },
+                        onEdit = { onEditControl(button) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth(),
+                    )
+                }
+            }
         }
     }
 }
@@ -864,6 +885,7 @@ private fun StripHeader(
     onMoveLeft: () -> Unit,
     onMoveRight: () -> Unit,
     onDeleteStrip: () -> Unit,
+    onRenameStrip: () -> Unit,
 ) {
     Row(
         Modifier
@@ -886,15 +908,29 @@ private fun StripHeader(
                 ),
             )
         }
-        BasicText(
-            strip.title,
-            style = TextStyle(
-                color = GlassText,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-            ),
-            maxLines = 1,
-        )
+        Box(
+            modifier = if (editMode) {
+                Modifier
+                    .weight(1f, fill = false)
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable(onClick = onRenameStrip)
+                    .padding(horizontal = 4.dp, vertical = 1.dp)
+            } else {
+                Modifier
+            },
+            contentAlignment = Alignment.Center,
+        ) {
+            BasicText(
+                strip.title,
+                style = TextStyle(
+                    color = if (editMode) GlassAccent else GlassText,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                ),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
         if (editMode) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -945,8 +981,9 @@ private fun StripVerticalFaderSlot(
     modifier: Modifier = Modifier,
 ) {
     val interactionSource = remember(control.id) { MutableInteractionSource() }
-    val unitsPerPixel = with(LocalDensity.current) { 16383f / 350.dp.toPx() }
+    val unitsPerPixel = with(LocalDensity.current) { 16383f / 280.dp.toPx() }
     val currentValue by rememberUpdatedState(control.value)
+    val currentOnEdit by rememberUpdatedState(onEdit)
     var dragValue by remember(control.id) { mutableFloatStateOf(control.value.toFloat()) }
     var isDragging by remember(control.id) { mutableStateOf(false) }
 
@@ -957,9 +994,7 @@ private fun StripVerticalFaderSlot(
     }
 
     val gestureModifier = if (editMode) {
-        Modifier.pointerInput(control.id, true) {
-            detectTapGestures(onTap = { onEdit() })
-        }
+        Modifier.clickable { currentOnEdit() }
     } else {
         Modifier.pointerInput(control.id, unitsPerPixel, false) {
             var press: PressInteraction.Press? = null
@@ -1158,9 +1193,9 @@ private fun StripKnobSlot(
     val interactionSource = remember(control.id) { MutableInteractionSource() }
     val unitsPerPixel = with(LocalDensity.current) { 16383f / 300.dp.toPx() }
     val currentValue by rememberUpdatedState(control.value)
+    val currentOnEdit by rememberUpdatedState(onEdit)
     var dragValue by remember(control.id) { mutableFloatStateOf(control.value.toFloat()) }
     var isDragging by remember(control.id) { mutableStateOf(false) }
-
     val dampedDragAnimation = remember(animationScope, control.id) {
         DampedDragAnimation(
             animationScope = animationScope,
@@ -1193,9 +1228,7 @@ private fun StripKnobSlot(
     }
 
     val gestureModifier = if (editMode) {
-        Modifier.pointerInput(control.id, true) {
-            detectTapGestures(onTap = { onEdit() })
-        }
+        Modifier.clickable { currentOnEdit() }
     } else {
         Modifier.pointerInput(control.id, unitsPerPixel, false) {
             var press: PressInteraction.Press? = null
@@ -1289,75 +1322,67 @@ private fun StripKnobSlot(
             )
         }
 
-        // 居中旋钮表盘与数值显示：在 Canvas 内取 min(宽, 高, 36.dp) 绘制正圆，绝不撑破槽位
-        Column(
+        // 居中旋钮表盘与数值显示：在 Canvas 内取 min(宽, 高, 56.dp) 绘制正圆，留出上下呼吸间距
+        Box(
             Modifier
                 .fillMaxSize()
-                .padding(horizontal = 2.dp, vertical = 2.dp)
+                .padding(horizontal = 3.dp, vertical = 2.dp)
                 .graphicsLayer {
                     val contentScale = lerp(1f, 1.08f, dampedDragAnimation.pressProgress)
                     scaleX = contentScale
                     scaleY = contentScale
                 },
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
+            contentAlignment = Alignment.Center,
         ) {
-            Box(
-                Modifier
-                    .weight(1f)
-                    .fillMaxWidth(),
-                contentAlignment = Alignment.Center,
-            ) {
-                Canvas(Modifier.fillMaxSize()) {
-                    val fraction = dampedDragAnimation.progress
-                    val diameter = minOf(size.width, size.height, 36.dp.toPx())
-                    val stroke = (diameter * 0.11f).coerceIn(3.2.dp.toPx(), 4.2.dp.toPx())
-                    val radius = ((diameter - stroke) / 2f - 1.5.dp.toPx()).coerceAtLeast(4f)
-                    val arcTopLeft = Offset(center.x - radius, center.y - radius)
-                    val arcSize = Size(radius * 2f, radius * 2f)
-                    drawArc(
-                        color = Color.Black.copy(alpha = 0.11f),
-                        startAngle = 135f,
-                        sweepAngle = 270f,
-                        useCenter = false,
-                        topLeft = arcTopLeft,
-                        size = arcSize,
-                        style = Stroke(stroke, cap = StrokeCap.Round),
-                    )
-                    drawArc(
-                        color = GlassAccent,
-                        startAngle = 135f,
-                        sweepAngle = 270f * fraction,
-                        useCenter = false,
-                        topLeft = arcTopLeft,
-                        size = arcSize,
-                        style = Stroke(stroke, cap = StrokeCap.Round),
-                    )
-                    val angleRad = ((135f + 270f * fraction) * PI / 180.0).toFloat()
-                    val dotCenter = Offset(
-                        x = center.x + cos(angleRad) * radius,
-                        y = center.y + sin(angleRad) * radius,
-                    )
-                    drawCircle(
-                        color = Color.White,
-                        radius = stroke * 0.60f,
-                        center = dotCenter,
-                    )
-                    drawCircle(
-                        color = GlassAccent,
-                        radius = stroke * 0.36f,
-                        center = dotCenter,
-                    )
-                }
-                BasicText(
-                    "${(dampedDragAnimation.progress * 100f).roundToInt()}",
-                    style = TextStyle(
-                        color = if (isDragging) GlassAccent else GlassText,
-                        fontSize = 8.sp,
-                        fontWeight = FontWeight.Bold,
-                    ),
+            Canvas(Modifier.fillMaxSize()) {
+                val fraction = dampedDragAnimation.progress
+                val diameter = minOf(size.width, size.height, 56.dp.toPx())
+                val stroke = (diameter * 0.11f).coerceIn(3.5.dp.toPx(), 5.8.dp.toPx())
+                val radius = ((diameter - stroke) / 2f - 1.5.dp.toPx()).coerceAtLeast(4f)
+                val arcTopLeft = Offset(center.x - radius, center.y - radius)
+                val arcSize = Size(radius * 2f, radius * 2f)
+                drawArc(
+                    color = Color.Black.copy(alpha = 0.11f),
+                    startAngle = 135f,
+                    sweepAngle = 270f,
+                    useCenter = false,
+                    topLeft = arcTopLeft,
+                    size = arcSize,
+                    style = Stroke(stroke, cap = StrokeCap.Round),
+                )
+                drawArc(
+                    color = GlassAccent,
+                    startAngle = 135f,
+                    sweepAngle = 270f * fraction,
+                    useCenter = false,
+                    topLeft = arcTopLeft,
+                    size = arcSize,
+                    style = Stroke(stroke, cap = StrokeCap.Round),
+                )
+                val angleRad = ((135f + 270f * fraction) * PI / 180.0).toFloat()
+                val dotCenter = Offset(
+                    x = center.x + cos(angleRad) * radius,
+                    y = center.y + sin(angleRad) * radius,
+                )
+                drawCircle(
+                    color = Color.White,
+                    radius = stroke * 0.60f,
+                    center = dotCenter,
+                )
+                drawCircle(
+                    color = GlassAccent,
+                    radius = stroke * 0.36f,
+                    center = dotCenter,
                 )
             }
+            BasicText(
+                "${(dampedDragAnimation.progress * 100f).roundToInt()}",
+                style = TextStyle(
+                    color = if (isDragging) GlassAccent else GlassText,
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.Bold,
+                ),
+            )
             val customTag = control.customStripLabel(fallbackTitle)
             val tag = if (editMode) {
                 customTag ?: fallbackTitle
@@ -1367,9 +1392,12 @@ private fun StripKnobSlot(
             if (tag != null) {
                 BasicText(
                     tag,
+                    Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 1.dp),
                     style = TextStyle(
                         color = if (editMode || isDragging) GlassAccent else GlassMuted,
-                        fontSize = 7.sp,
+                        fontSize = 8.5.sp,
                         fontWeight = FontWeight.SemiBold,
                     ),
                     maxLines = 1,
@@ -1396,14 +1424,13 @@ private fun StripLiquidButtonSlot(
     modifier: Modifier = Modifier,
 ) {
     val isPressed = control.value > 0
+    val currentOnEdit by rememberUpdatedState(onEdit)
     val scale by animateFloatAsState(
         targetValue = if (isPressed) 0.94f else 1f,
         label = "stripButtonScale",
     )
     val gestureModifier = if (editMode) {
-        Modifier.pointerInput(control.id, true) {
-            detectTapGestures(onTap = { onEdit() })
-        }
+        Modifier.clickable { currentOnEdit() }
     } else {
         Modifier.pointerInput(control.id, false) {
             detectTapGestures(
@@ -1418,7 +1445,7 @@ private fun StripLiquidButtonSlot(
             )
         }
     }
-    val shape = RoundedCornerShape(50)
+    val shape = RoundedCornerShape(16.dp)
     Box(
         modifier
             .graphicsLayer {
@@ -1452,7 +1479,7 @@ private fun StripLiquidButtonSlot(
                     isPressed || editMode -> GlassAccent
                     else -> GlassText
                 },
-                fontSize = 9.sp,
+                fontSize = 11.sp,
                 fontWeight = FontWeight.SemiBold,
             ),
             maxLines = 1,
@@ -1461,8 +1488,10 @@ private fun StripLiquidButtonSlot(
     }
 }
 
+private val STRIP_PREFIX_REGEX = Regex("^CH\\s+\\d+\\s+")
+
 private fun Control.shortStripLabel(fallback: String): String {
-    val trimmed = label.replace(Regex("^CH\\s+\\d+\\s+"), "").trim()
+    val trimmed = label.replace(STRIP_PREFIX_REGEX, "").trim()
     return trimmed.ifBlank { fallback }
 }
 
