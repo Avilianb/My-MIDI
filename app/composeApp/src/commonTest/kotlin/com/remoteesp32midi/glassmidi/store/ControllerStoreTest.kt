@@ -465,6 +465,31 @@ class ControllerStoreTest {
         assertEquals(20, store.state.value.controls.size)
     }
 
+    @Test
+    fun devicePortHandshakeIsSentOnReadyAndWhenSwitched() = runTest {
+        val transport = FakeTransport()
+        val layoutStore = InMemoryLayoutStore(PersistedState(devicePort = 1))
+        val store = ControllerStore(transport, layoutStore, backgroundScope)
+        runCurrent()
+        assertEquals(1, store.state.value.devicePort)
+
+        transport.emit(
+            TransportEvent.ConnectionChanged(
+                com.remoteesp32midi.glassmidi.ble.BleConnection(
+                    phase = com.remoteesp32midi.glassmidi.ble.ConnectionPhase.READY,
+                    deviceName = "ESP32-S3 MIDI",
+                    deviceAddress = "AA:BB",
+                )
+            )
+        )
+        runCurrent()
+        assertEquals(listOf(MidiMessage.portSelect(1)), transport.sent.first())
+
+        store.setDevicePort(0)
+        assertEquals(0, store.state.value.devicePort)
+        assertEquals(listOf(MidiMessage.portSelect(0)), transport.sent.last())
+    }
+
     private fun androidxMidiMapping(
         type: MidiType,
         channel: Int,

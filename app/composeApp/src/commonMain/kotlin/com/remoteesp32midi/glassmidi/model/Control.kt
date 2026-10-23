@@ -55,6 +55,8 @@ data class PersistedState(
     val layout: Layout = Layout(),
     val deviceAddress: String? = null,
     val deviceName: String? = null,
+    /** 0 = 乐手 1 (USB Port 1 / Cable 0)，1 = 乐手 2 (USB Port 2 / Cable 1) */
+    val devicePort: Int = 0,
 )
 
 fun ControlKind.supportsNote(): Boolean = this == ControlKind.BUTTON

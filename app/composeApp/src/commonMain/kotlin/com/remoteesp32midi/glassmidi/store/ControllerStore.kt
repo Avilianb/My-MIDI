@@ -43,6 +43,8 @@ data class UiState(
     val scanning: Boolean = false,
     val lastDeviceAddress: String? = null,
     val lastDeviceName: String? = null,
+    /** 0 = 乐手 1 (USB Port 1)，1 = 乐手 2 (USB Port 2) */
+    val devicePort: Int = 0,
     val error: String? = null,
     val loaded: Boolean = false,
 )
@@ -80,6 +82,7 @@ class ControllerStore(
                     controls = controls,
                     lastDeviceAddress = persisted.deviceAddress,
                     lastDeviceName = persisted.deviceName,
+                    devicePort = persisted.devicePort.coerceIn(0, 1),
                     loaded = true,
                 )
             }
@@ -115,7 +118,8 @@ class ControllerStore(
                             )
                         }
                         if (connection.phase == ConnectionPhase.READY) {
-                            // 重连/首次 Ready 后恢复连续控件在 DAW 侧的当前值。
+                            // 先向 ESP32 发送本机所属乐手端口握手包（Port 1 / Port 2），再同步连续控件当前值。
+                            transport.send(listOf(MidiMessage.portSelect(_state.value.devicePort)))
                             _state.value.controls
                                 .filter { it.kind != ControlKind.BUTTON }
                                 .forEach { sendContinuous(it, it.value) }
@@ -209,6 +213,20 @@ class ControllerStore(
 
     fun clearError() {
         _state.update { it.copy(error = null) }
+    }
+
+    /** 切换本机绑定的 ESP32 USB 虚拟端口（0 = 乐手 1 / Port 1，1 = 乐手 2 / Port 2）。 */
+    fun setDevicePort(portIndex: Int) {
+        val normalized = portIndex.coerceIn(0, 1)
+        if (_state.value.devicePort == normalized) return
+        _state.update { it.copy(devicePort = normalized) }
+        if (_state.value.connection.phase == ConnectionPhase.READY) {
+            transport.send(listOf(MidiMessage.portSelect(normalized)))
+            _state.value.controls
+                .filter { it.kind != ControlKind.BUTTON }
+                .forEach { sendContinuous(it, it.value) }
+        }
+        scheduleSave()
     }
 
     /** 返回 null 表示保存成功，否则返回给界面展示的校验错误。 */
@@ -702,6 +720,7 @@ class ControllerStore(
                     layout = Layout(controls = current.controls),
                     deviceAddress = current.lastDeviceAddress,
                     deviceName = current.lastDeviceName,
+                    devicePort = current.devicePort,
                 )
             )
         }

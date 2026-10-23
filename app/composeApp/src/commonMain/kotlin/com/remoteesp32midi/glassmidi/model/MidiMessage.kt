@@ -56,6 +56,13 @@ data class MidiMessage(
             )
         }
 
+        /**
+         * 发送给 ESP32-S3 的端口握手消息（[0xF4, 0x7D, portIndex]）。
+         * 固件拦截此消息并将当前手机连接绑定到 USB 虚拟端口 portIndex (0 = Port 1, 1 = Port 2)，不会转发到电脑。
+         */
+        fun portSelect(portIndex: Int): MidiMessage =
+            MidiMessage(0xF4, 0x7D, portIndex.coerceIn(0, 1))
+
         private fun channelZeroBased(channel: Int): Int {
             require(channel in 1..16) { "channel out of range: $channel" }
             return channel - 1

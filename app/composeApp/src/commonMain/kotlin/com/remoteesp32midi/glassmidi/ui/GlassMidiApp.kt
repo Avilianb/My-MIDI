@@ -248,6 +248,7 @@ fun GlassMidiApp(
                             onStopScan = { store.stopScan() },
                             onDisconnect = onDisconnect,
                             onConnect = onConnect,
+                            onSelectDevicePort = { store.setDevicePort(it) },
                             onClearError = { store.clearError() },
                             modifier = Modifier
                                 .weight(1f)
@@ -450,6 +451,7 @@ private fun ConnectionSettingsScreen(
     onStopScan: () -> Unit,
     onDisconnect: () -> Unit,
     onConnect: (BleDevice) -> Unit,
+    onSelectDevicePort: (Int) -> Unit,
     onClearError: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -585,6 +587,51 @@ private fun ConnectionSettingsScreen(
             contentPadding = PaddingValues(16.dp),
         ) {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        BasicText(
+                            "乐手身份与电脑端口（一拖二模式）",
+                            style = TextStyle(GlassText, 14.sp, FontWeight.SemiBold),
+                        )
+                        BasicText(
+                            "两台手机同时连同一个 ESP32 时，按此选择分别路由到电脑的 MIDI 端口 1 或端口 2",
+                            style = TextStyle(GlassMuted, 10.sp),
+                        )
+                    }
+                }
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    GlassPill(
+                        text = "乐手 1 · Port 1",
+                        onClick = { onSelectDevicePort(0) },
+                        backdrop = backdrop,
+                        selected = state.devicePort == 0,
+                        modifier = Modifier.weight(1f),
+                    )
+                    GlassPill(
+                        text = "乐手 2 · Port 2",
+                        onClick = { onSelectDevicePort(1) },
+                        backdrop = backdrop,
+                        selected = state.devicePort == 1,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+        }
+
+        GlassSurface(
+            backdrop = backdrop,
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(24.dp),
+            contentPadding = PaddingValues(16.dp),
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 BasicText(
                     if (state.scanning) {
                         "正在扫描 BLE-MIDI 设备..."
@@ -691,12 +738,12 @@ private fun Hairline() {
 }
 
 private fun UiState.connectionTitle(): String = when (connection.phase) {
-    ConnectionPhase.READY -> "已连接"
+    ConnectionPhase.READY -> "已连接 · Port ${devicePort + 1}"
     ConnectionPhase.SCANNING -> "正在扫描"
     ConnectionPhase.CONNECTING -> "连接中"
     ConnectionPhase.RECONNECTING -> "正在重连"
     ConnectionPhase.ERROR -> "连接异常"
-    ConnectionPhase.IDLE -> "未连接"
+    ConnectionPhase.IDLE -> "未连接 · Port ${devicePort + 1}"
 }
 
 private fun UiState.connectionDetail(): String = when (connection.phase) {

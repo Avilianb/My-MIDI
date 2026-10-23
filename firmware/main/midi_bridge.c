@@ -31,6 +31,7 @@ static const char *TAG = "midi_bridge";
 #define LAT_BUCKET_COUNT 64
 
 typedef struct {
+    uint8_t cable_num;
     uint8_t len;
     uint8_t data[MIDI_MSG_MAX_LEN];
     int64_t rx_time_us;
@@ -38,7 +39,6 @@ typedef struct {
 
 static QueueHandle_t s_ble_to_usb;
 static QueueHandle_t s_usb_to_ble;
-
 static volatile uint32_t s_ble_rx_dropped;
 static volatile uint32_t s_ble_to_usb_sent;
 static volatile uint32_t s_ble_to_usb_dropped;
@@ -53,14 +53,14 @@ static uint32_t s_lat_hist[LAT_BUCKET_COUNT];
 static uint32_t s_lat_count;
 static uint32_t s_lat_max_us;
 
-/** 把一条消息完整写入 USB；FIFO 满时最多重试 5 ms。 */
-static bool usb_write_all(const uint8_t *data, uint8_t len)
+/** 把一条消息完整写入指定 USB 虚拟端口；FIFO 满时最多重试 5 ms。 */
+static bool usb_write_all(uint8_t cable_num, const uint8_t *data, uint8_t len)
 {
     uint32_t sent = 0;
     const int64_t deadline = esp_timer_get_time() + USB_WRITE_RETRY_US;
 
     while (sent < len) {
-        const uint32_t written = usb_midi_write(data + sent, len - sent);
+        const uint32_t written = usb_midi_write(cable_num, data + sent, len - sent);
         sent += written;
         if (sent >= len) {
             return true;
@@ -72,7 +72,6 @@ static bool usb_write_all(const uint8_t *data, uint8_t len)
     }
     return true;
 }
-
 /** 记录 BLE 回调入队到 USB 写完的延迟。 */
 static void latency_record(int64_t rx_time_us)
 {
@@ -112,10 +111,10 @@ static uint32_t latency_percentile(uint32_t percent)
     return 6300;
 }
 
-/** 向 USB 发送 16 通道 All Notes Off / All Sound Off / Sustain Off。 */
-static void usb_send_panic(void)
+/** 向指定 USB 虚拟端口发送 16 通道 All Notes Off / All Sound Off / Sustain Off。 */
+static void usb_send_panic_cable(uint8_t cable_num)
 {
-    if (!usb_midi_device_mounted()) {
+    if (!usb_midi_device_mounted() || cable_num >= USB_MIDI_CABLE_COUNT) {
         return;
     }
 
@@ -129,10 +128,17 @@ static void usb_send_panic(void)
             if (!usb_midi_device_mounted()) {
                 return;
             }
-            if (!usb_write_all(messages[i], sizeof(messages[i]))) {
+            if (!usb_write_all(cable_num, messages[i], sizeof(messages[i]))) {
                 s_panic_failures++;
             }
         }
+    }
+}
+
+static void usb_send_panic_all(void)
+{
+    for (uint8_t c = 0; c < USB_MIDI_CABLE_COUNT; c++) {
+        usb_send_panic_cable(c);
     }
 }
 
@@ -144,13 +150,13 @@ static void clear_queues(void)
     s_queue_flushes++;
 }
 
-/** USB-MIDI 4 字节事件包 → 完整 MIDI 消息；SysEx 首期不转发。 */
+/** USB-MIDI 4 字节事件包 → 完整 MIDI 消息；支持 Cable 0 与 Cable 1。 */
 static bool usb_packet_to_message(const uint8_t pkt[4], midi_msg_t *out)
 {
-    if ((pkt[0] >> 4) != 0) {
-        return false; /* 只支持 cable 0 */
+    const uint8_t cable_num = (uint8_t)(pkt[0] >> 4);
+    if (cable_num >= USB_MIDI_CABLE_COUNT) {
+        return false;
     }
-
     uint8_t len;
     switch (pkt[0] & 0x0F) {
     case 0x08: /* Note Off */
@@ -174,6 +180,7 @@ static bool usb_packet_to_message(const uint8_t pkt[4], midi_msg_t *out)
         return false;
     }
 
+    out->cable_num = cable_num;
     out->len = len;
     memcpy(out->data, &pkt[1], len);
     out->rx_time_us = esp_timer_get_time();
@@ -184,18 +191,20 @@ static void usb_task(void *arg)
 {
     (void)arg;
     int64_t next_log_us = esp_timer_get_time() + 5000000;
-    bool was_ready = false;
+    bool was_port_ready[USB_MIDI_CABLE_COUNT] = { false, false };
     bool was_mounted = false;
 
     for (;;) {
         const bool mounted = usb_midi_device_mounted();
-        const bool ready = ble_midi_link_ready();
 
-        /* BLE 断开/通知关闭：先清音，再丢弃旧队列。 */
-        if (was_ready && !ready) {
-            ESP_LOGW(TAG, "BLE ready -> false; panic");
-            usb_send_panic();
-            clear_queues();
+        /* 某一路 BLE 断开/通知关闭：只对该乐手的 USB 虚拟端口发 panic，不影响另一位乐手。 */
+        for (uint8_t c = 0; c < USB_MIDI_CABLE_COUNT; c++) {
+            const bool port_ready = ble_midi_link_port_ready(c);
+            if (was_port_ready[c] && !port_ready) {
+                ESP_LOGW(TAG, "BLE port %u ready -> false; panic cable %u", c + 1, c);
+                usb_send_panic_cable(c);
+            }
+            was_port_ready[c] = port_ready;
         }
 
         /* USB 卸载：清掉不能在重枚举后重放的消息。 */
@@ -204,40 +213,33 @@ static void usb_task(void *arg)
             clear_queues();
         }
 
-        /* USB 新挂载：等主机枚举完成，再发一次 panic。 */
+        /* USB 新挂载：等主机枚举完成，再对两个端口发一次 panic。 */
         if (!was_mounted && mounted) {
             vTaskDelay(pdMS_TO_TICKS(50));
             if (usb_midi_device_mounted()) {
-                ESP_LOGI(TAG, "USB mounted; panic");
-                usb_send_panic();
+                ESP_LOGI(TAG, "USB mounted; panic all cables");
+                usb_send_panic_all();
             }
             clear_queues();
         }
 
-        /* BLE 重新就绪：连接期间缓存的旧消息不能重放。 */
-        if (!was_ready && ready) {
-            clear_queues();
-        }
-
-        was_ready = ready;
         was_mounted = mounted;
 
         midi_msg_t msg;
 
-        /* BLE → USB：先排空，保证 Note Off 不被 USB OUT 读取拖住。 */
+        /* BLE → USB：先排空，按 msg.cable_num 写入对应的 USB 虚拟线缆（Port 1 / Port 2）。 */
         while (xQueueReceive(s_ble_to_usb, &msg, 0) == pdTRUE) {
-            if (!usb_midi_device_mounted() || !ble_midi_link_ready()) {
+            if (!usb_midi_device_mounted() || !ble_midi_link_port_ready(msg.cable_num)) {
                 s_ble_to_usb_dropped++;
                 continue;
             }
-            if (usb_write_all(msg.data, msg.len)) {
+            if (usb_write_all(msg.cable_num, msg.data, msg.len)) {
                 s_ble_to_usb_sent++;
                 latency_record(msg.rx_time_us);
             } else {
                 s_ble_to_usb_dropped++;
             }
         }
-
         /* USB → BLE：一次最多读取 16 个 4 字节事件包。 */
         uint8_t packets[USB_READ_BATCH * 4];
         const uint32_t count = usb_midi_read_packets(packets, USB_READ_BATCH);
@@ -289,14 +291,22 @@ static void ble_task(void *arg)
         if (xQueueReceive(s_usb_to_ble, &batch[0], pdMS_TO_TICKS(10)) != pdTRUE) {
             continue;
         }
-
+        const uint8_t target_cable = batch[0].cable_num;
         size_t count = 1;
-        while (count < MIDI_BATCH_MAX &&
-               xQueueReceive(s_usb_to_ble, &batch[count], 0) == pdTRUE) {
-            count++;
+        while (count < MIDI_BATCH_MAX) {
+            midi_msg_t peeked;
+            if (xQueuePeek(s_usb_to_ble, &peeked, 0) != pdTRUE ||
+                peeked.cable_num != target_cable) {
+                break;
+            }
+            if (xQueueReceive(s_usb_to_ble, &batch[count], 0) == pdTRUE) {
+                count++;
+            } else {
+                break;
+            }
         }
 
-        if (!ble_midi_link_ready()) {
+        if (!ble_midi_link_port_ready(target_cable)) {
             s_usb_to_ble_dropped += count;
             continue;
         }
@@ -308,7 +318,7 @@ static void ble_task(void *arg)
             lens[i] = batch[i].len;
         }
 
-        if (ble_midi_link_send(msgs, lens, (uint16_t)count) == ESP_OK) {
+        if (ble_midi_link_send(target_cable, msgs, lens, (uint16_t)count) == ESP_OK) {
             s_usb_to_ble_sent += count;
         } else {
             s_usb_to_ble_dropped += count;
@@ -350,14 +360,15 @@ esp_err_t midi_bridge_start(void)
     return ESP_OK;
 }
 
-void midi_bridge_on_ble_midi(const uint8_t *msg, uint8_t len, int64_t rx_time_us)
+void midi_bridge_on_ble_midi(uint8_t cable_num, const uint8_t *msg, uint8_t len, int64_t rx_time_us)
 {
-    if (msg == NULL || len == 0 || len > MIDI_MSG_MAX_LEN) {
+    if (msg == NULL || len == 0 || len > MIDI_MSG_MAX_LEN || cable_num >= USB_MIDI_CABLE_COUNT) {
         s_ble_rx_dropped++;
         return;
     }
 
     midi_msg_t item = {
+        .cable_num = cable_num,
         .len = len,
         .rx_time_us = rx_time_us,
     };

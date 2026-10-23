@@ -37,6 +37,7 @@ class AndroidLayoutStore(context: Context) : LayoutStore {
                 ),
                 deviceAddress = root.optString("deviceAddress").takeIf { it.isNotBlank() },
                 deviceName = root.optString("deviceName").takeIf { it.isNotBlank() },
+                devicePort = root.optInt("devicePort", 0).coerceIn(0, 1),
             )
         }.getOrElse { PersistedState() }
     }
@@ -46,6 +47,7 @@ class AndroidLayoutStore(context: Context) : LayoutStore {
             put("schemaVersion", SCHEMA_VERSION)
             put("deviceAddress", state.deviceAddress ?: "")
             put("deviceName", state.deviceName ?: "")
+            put("devicePort", state.devicePort.coerceIn(0, 1))
             put(
                 "layout",
                 JSONObject().apply {

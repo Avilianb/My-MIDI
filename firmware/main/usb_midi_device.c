@@ -31,47 +31,53 @@ enum usb_endpoints {
 #endif
 };
 
-/** TinyUSB descriptors **/
+/** TinyUSB 双虚拟线缆（Port 1 / Port 2）描述符 **/
 
-#define TUSB_DESCRIPTOR_TOTAL_LEN (TUD_CONFIG_DESC_LEN + CFG_TUD_MIDI * TUD_MIDI_DESC_LEN)
+#define TUD_MIDI_DUAL_DESC_LEN \
+    (TUD_MIDI_DESC_HEAD_LEN + 2 * TUD_MIDI_DESC_JACK_LEN + 2 * TUD_MIDI_DESC_EP_LEN(2))
+
+#define TUD_MIDI_DUAL_DESCRIPTOR(_itfnum, _stridx, _stridx_c1, _stridx_c2, _epout, _epin, _epsize) \
+    TUD_MIDI_DESC_HEAD(_itfnum, _stridx, 2), \
+    TUD_MIDI_DESC_JACK_DESC(1, _stridx_c1), \
+    TUD_MIDI_DESC_JACK_DESC(2, _stridx_c2), \
+    TUD_MIDI_DESC_EP(_epout, _epsize, 2), \
+    TUD_MIDI_JACKID_IN_EMB(1), \
+    TUD_MIDI_JACKID_IN_EMB(2), \
+    TUD_MIDI_DESC_EP(_epin, _epsize, 2), \
+    TUD_MIDI_JACKID_OUT_EMB(1), \
+    TUD_MIDI_JACKID_OUT_EMB(2)
+
+#define TUSB_DESCRIPTOR_TOTAL_LEN (TUD_CONFIG_DESC_LEN + CFG_TUD_MIDI * TUD_MIDI_DUAL_DESC_LEN)
 
 /**
  * @brief String descriptor
  */
-static const char *s_str_desc[5] = {
+static const char *s_str_desc[7] = {
     // array of pointer to string descriptors
     (char[]){0x09, 0x04},   // 0: supported language is English (0x0409)
     "Remote MIDI",          // 1: Manufacturer
     "ESP32-S3 MIDI Bridge", // 2: Product
     "ESP32S3-MIDI-01",      // 3: Serial
     "ESP32-S3 MIDI Bridge", // 4: MIDI interface
+    "ESP32-S3 MIDI 1",      // 5: Virtual Cable 0 (Player 1)
+    "ESP32-S3 MIDI 2",      // 6: Virtual Cable 1 (Player 2)
 };
 
 /**
- * @brief Configuration descriptor
- *
- * This is a simple configuration descriptor that defines 1 configuration and a MIDI interface
+ * @brief Configuration descriptor (Full Speed, 2 Virtual MIDI Cables)
  */
 static const uint8_t s_midi_cfg_desc[] = {
-    // Configuration number, interface count, string index, total length, attribute, power in mA
     TUD_CONFIG_DESCRIPTOR(1, ITF_COUNT, 0, TUSB_DESCRIPTOR_TOTAL_LEN, 0, 100),
-
-    // Interface number, string index, EP Out & EP In address, EP size
-    TUD_MIDI_DESCRIPTOR(ITF_NUM_MIDI, 4, EPNUM_MIDI, (0x80 | EPNUM_MIDI), 64),
+    TUD_MIDI_DUAL_DESCRIPTOR(ITF_NUM_MIDI, 4, 5, 6, EPNUM_MIDI, (0x80 | EPNUM_MIDI), 64),
 };
 
 #if (TUD_OPT_HIGH_SPEED)
 /**
- * @brief High Speed configuration descriptor
- *
- * This is a simple configuration descriptor that defines 1 configuration and a MIDI interface
+ * @brief High Speed configuration descriptor (2 Virtual MIDI Cables)
  */
 static const uint8_t s_midi_hs_cfg_desc[] = {
-    // Configuration number, interface count, string index, total length, attribute, power in mA
     TUD_CONFIG_DESCRIPTOR(1, ITF_COUNT, 0, TUSB_DESCRIPTOR_TOTAL_LEN, 0, 100),
-
-    // Interface number, string index, EP Out & EP In address, EP size
-    TUD_MIDI_DESCRIPTOR(ITF_NUM_MIDI, 4, EPNUM_MIDI, (0x80 | EPNUM_MIDI), 512),
+    TUD_MIDI_DUAL_DESCRIPTOR(ITF_NUM_MIDI, 4, 5, 6, EPNUM_MIDI, (0x80 | EPNUM_MIDI), 512),
 };
 #endif // TUD_OPT_HIGH_SPEED
 
@@ -104,12 +110,12 @@ bool usb_midi_device_mounted(void)
     return tud_midi_mounted();
 }
 
-uint32_t usb_midi_write(const uint8_t *data, uint32_t len)
+uint32_t usb_midi_write(uint8_t cable_num, const uint8_t *data, uint32_t len)
 {
-    if (data == NULL || len == 0 || !tud_midi_mounted()) {
+    if (data == NULL || len == 0 || cable_num >= USB_MIDI_CABLE_COUNT || !tud_midi_mounted()) {
         return 0;
     }
-    return tud_midi_stream_write(0, data, len);
+    return tud_midi_stream_write(cable_num, data, len);
 }
 
 uint32_t usb_midi_read_packets(uint8_t *packets, uint32_t max_packets)
