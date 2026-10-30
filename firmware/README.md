@@ -81,9 +81,8 @@ Windows / macOS 的 DAW（如 Ableton Live）会识别到 2 个独立的 MIDI �
   `7772e5db-3868-4112-a1a9-f2669d106bf3`
 - 属性：`Read`、`Write Without Response`、`Notify`
 - 连接后实际 MTU 为 247（不同适配器可能不同）；Windows 测试中连接间隔为 15 ms。
-- 广播使用 BLE 5 extended advertising，因为 128-bit UUID + 名称放不进 31 字节 legacy payload；
-  手机端必须支持 BLE 5 extended scanning（例如 iPhone 8 及以后、带 BLE 5 的 Android 8+
-  机型）。只支持 legacy advertising 的旧手机会扫不到该设备；这是当前广播数据长度的取舍。
+- 广播使用 legacy 可连接/可扫描 PDU，广告中放 Flags + 128-bit MIDI UUID，名称放 Scan Response。
+  保留 ESP-IDF 扩展广播 API 管理单实例，同时兼容 BLE 4.x 手机的 legacy 扫描。
 
 ### BLE-MIDI 包格式
 
@@ -254,3 +253,21 @@ USB->BLE sent=0 drop=0; unsupported=0 tx_drop=0 usb_unsupported=0 flushes=14 pan
 - **延迟偏高**：确认 `sdkconfig` 中 `CONFIG_FREERTOS_HZ=1000`；默认 100 Hz 会把 1 ms
   轮询变成 10 ms。执行干净构建后重新烧录。
 - **COM5 打不开**：关闭其他串口监视器/Arduino IDE；`idf.py monitor` 与烧录不能同时占用 UART。
+
+## 2026-10-31 稳定性修复
+
+详见 [稳定性审查](../docs/STABILITY_REVIEW.md)。桥接消息携带端口归属代次，连接、订阅、断开、换绑与 Host reset 都使旧消息失效。BLE 回调零等待入队；USB 消费每轮最多 32 条；清音每端口每轮最多 8 条，FIFO 满时保留待发送状态。队列/FIFO 过载时中止该端口积压并清音，可能短暂中断该乐手的音符，但不会继续重放不完整的按键序列。USB 写入使用完整的 4 字节 event packet。
+
+旧版文档中的“Note Off 永不丢失/旧位图补发”与固定 5ms 重试窗口描述已被上述恢复策略取代；5 分钟/双手机实测表是此前版本记录，不能当作本修复版的验收结果。
+
+macOS / Linux 构建：
+
+```sh
+. /path/to/esp-idf/export.sh
+idf.py -C firmware set-target esp32s3
+idf.py -C firmware build
+idf.py -C firmware -p /dev/cu.usbserial-120 -b 115200 flash
+sh firmware/tests/run_host_tests.sh
+```
+
+串口路径以实际枚举为准。测试在实际桥接 C 源码上模拟 FIFO 满载，使用 AddressSanitizer/UndefinedBehaviorSanitizer 检查。

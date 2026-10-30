@@ -38,6 +38,9 @@ class BleMidiCodec {
             index++
 
             val first = packet.readRawByte(index, "message start")
+            // Clock/transport/active sensing may share a notification with CCs.
+            // UI ignores them, but they must not discard the rest of the packet.
+            if (first >= 0xF8) { index++; continue }
             if (first and 0x80 != 0) {
                 index++
                 val status = first

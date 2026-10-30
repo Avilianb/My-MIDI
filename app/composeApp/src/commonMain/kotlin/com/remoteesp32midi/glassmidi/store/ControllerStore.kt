@@ -68,6 +68,7 @@ class ControllerStore(
     private val suppressedContinuousIds = mutableSetOf<String>()
     private val echoSuppressionJobs = mutableMapOf<String, Job>()
     private var saveJob: Job? = null
+    private val soundingButtons = mutableMapOf<String, Control>()
 
     init {
         scope.launch {
@@ -138,6 +139,7 @@ class ControllerStore(
                             // 由固件在端口绑定时回放它缓存的 USB 侧最近状态（见 midi_bridge 影子缓存）。
                             transport.send(listOf(MidiMessage.portSelect(_state.value.devicePort, force = false)))
                         } else {
+                            soundingButtons.clear()
                             pendingContinuous.value = emptyMap()
                             pendingFourteenBit.clear()
                             clearEchoSuppression()
@@ -225,6 +227,10 @@ class ControllerStore(
         }
     }
 
+    fun reportError(message: String) {
+        _state.update { it.copy(error = message) }
+    }
+
     fun clearError() {
         _state.update { it.copy(error = null) }
     }
@@ -233,12 +239,11 @@ class ControllerStore(
     fun setDevicePort(portIndex: Int) {
         val normalized = portIndex.coerceIn(0, 1)
         if (_state.value.devicePort == normalized) return
+        resetPortState()
         _state.update { it.copy(devicePort = normalized) }
         if (_state.value.connection.phase == ConnectionPhase.READY) {
             transport.send(listOf(MidiMessage.portSelect(normalized, force = true)))
-            _state.value.controls
-                .filter { it.kind != ControlKind.BUTTON }
-                .forEach { sendContinuous(it, it.value) }
+
         }
         scheduleSave()
     }
@@ -249,10 +254,16 @@ class ControllerStore(
             if (it.id.isBlank()) it.copy(id = newId()) else it
         }
         val value = normalized.value.coerceIn(normalized.kind.valueRange())
-        val control = normalized.copy(value = value)
+        var control = normalized.copy(value = value)
         val error = validateControl(control, _state.value.controls)
         if (error != null) return error
 
+        val previous = _state.value.controls.firstOrNull { it.id == control.id }
+        if (previous != null && (previous.mapping != control.mapping || previous.buttonBehavior != control.buttonBehavior)) {
+            releaseButton(previous.id)
+            if (control.kind == ControlKind.BUTTON) control = control.copy(value = 0)
+            pendingContinuous.update { it - previous.id }
+        }
         _state.update { current ->
             val existingIndex = current.controls.indexOfFirst { it.id == control.id }
             val controls = if (existingIndex >= 0) {
@@ -267,6 +278,7 @@ class ControllerStore(
     }
 
     fun deleteControl(id: String) {
+        releaseButton(id)
         _state.update { current ->
             current.copy(controls = current.controls.filterNot { it.id == id })
         }
@@ -374,6 +386,8 @@ class ControllerStore(
     }
 
     fun deleteChannelStrip(stripIndex: Int) {
+        releaseAllButtons()
+        pendingContinuous.value = emptyMap()
         var removedIds: List<String> = emptyList()
         _state.update { current ->
             val stripCount = current.controls.size / CONTROLS_PER_STRIP
@@ -402,6 +416,8 @@ class ControllerStore(
 
     fun moveChannelStrip(fromStripIndex: Int, toStripIndex: Int) {
         if (fromStripIndex == toStripIndex) return
+        releaseAllButtons()
+        pendingContinuous.value = emptyMap()
         var moved = false
         _state.update { current ->
             val stripCount = current.controls.size / CONTROLS_PER_STRIP
@@ -530,6 +546,29 @@ class ControllerStore(
         return result
     }
 
+    private fun releaseButton(id: String) {
+        val control = soundingButtons.remove(id) ?: return
+        val message = when (control.mapping.type) {
+            MidiType.NOTE -> MidiMessage.noteOff(control.mapping.channel, control.mapping.number)
+            MidiType.CC -> MidiMessage.controlChange(control.mapping.channel, control.mapping.number, 0)
+            MidiType.PITCH_BEND -> return
+        }
+        transport.send(listOf(message))
+        updateValue(id, 0)
+    }
+
+    private fun releaseAllButtons() = soundingButtons.keys.toList().forEach { releaseButton(it) }
+
+    private fun resetPortState() {
+        soundingButtons.clear() // Firmware panics the old cable when ownership changes.
+        pendingContinuous.value = emptyMap()
+        pendingFourteenBit.clear()
+        clearEchoSuppression()
+        _state.update { current -> current.copy(controls = current.controls.map {
+            if (it.kind == ControlKind.BUTTON) it.copy(value = 0) else it
+        }) }
+    }
+
     fun buttonDown(id: String) {
         val control = _state.value.controls.find { it.id == id } ?: return
         if (control.kind != ControlKind.BUTTON) return
@@ -548,6 +587,7 @@ class ControllerStore(
                 )
                 MidiType.PITCH_BEND -> return
             }
+            if (nextValue > 0) soundingButtons[id] = control else soundingButtons.remove(id)
             updateValue(id, nextValue)
             transport.send(listOf(message))
             scheduleSave()
@@ -558,6 +598,7 @@ class ControllerStore(
             MidiType.CC -> MidiMessage.controlChange(control.mapping.channel, control.mapping.number, 127)
             MidiType.PITCH_BEND -> return
         }
+        soundingButtons[id] = control
         updateValue(id, 127)
         transport.send(listOf(message))
     }
@@ -571,6 +612,7 @@ class ControllerStore(
             MidiType.CC -> MidiMessage.controlChange(control.mapping.channel, control.mapping.number, 0)
             MidiType.PITCH_BEND -> return
         }
+        soundingButtons.remove(id)
         updateValue(id, 0)
         transport.send(listOf(message))
         scheduleSave()
@@ -642,6 +684,7 @@ class ControllerStore(
             if (message.isPortHandshake) {
                 val assignedPort = message.handshakePortIndex
                 if (_state.value.devicePort != assignedPort) {
+                    resetPortState()
                     _state.update { it.copy(devicePort = assignedPort) }
                     changed = true
                     // 端口变了也不推值：新端口以 DAW 为准，固件会在绑定后回放该端口的影子状态。

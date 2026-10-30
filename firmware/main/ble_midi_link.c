@@ -10,6 +10,7 @@
 #include "ble_midi_link.h"
 
 #include <string.h>
+#include <stdatomic.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -24,6 +25,7 @@
 #include "nimble/ble.h"
 #include "nimble/hci_common.h"
 #include "nimble/nimble_port.h"
+#include "nimble/nimble_npl.h"
 #include "nimble/nimble_port_freertos.h"
 #include "os/os_mbuf.h"
 #include "services/gap/ble_svc_gap.h"
@@ -36,12 +38,14 @@ static const char *TAG = "ble_midi";
 #define BLE_MIDI_MAX_PKT_SIZE 256
 #define BLE_ADV_INSTANCE      0
 
-/* AD 结构：Flags + Complete 128-bit UUID + Complete Local Name。 */
+/* Legacy advertisement: flags + MIDI UUID; local name goes in scan response. */
 static const uint8_t s_ext_adv_data[] = {
     0x02, 0x01, 0x06, /* Flags: LE General Discoverable, BR/EDR not supported */
     0x11, 0x07,       /* 17 bytes, Complete List of 128-bit Service UUIDs */
     0x00, 0xC7, 0xC4, 0x4E, 0xE3, 0x6C, 0x51, 0xA7,
     0x33, 0x4B, 0xE8, 0xED, 0x5A, 0x0E, 0xB8, 0x03,
+};
+static const uint8_t s_scan_rsp_data[] = {
     0x0E, 0x09,       /* 14 bytes, Complete Local Name */
     'E', 'S', 'P', '3', '2', '-', 'S', '3', ' ', 'M', 'I', 'D', 'I',
 };
@@ -50,6 +54,7 @@ typedef struct {
     bool connected;
     bool notify_enabled;
     bool explicit_claim;
+    bool assignment_pending;
     uint16_t conn_handle;
     uint16_t mtu;
     uint8_t cable_num;
@@ -63,7 +68,9 @@ static ble_midi_rx_cb_t s_rx_cb;
 static uint16_t s_midi_chr_val_handle;
 static uint8_t s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
 static bool s_synced;
-static bool s_start_requested;
+static _Atomic bool s_start_requested;
+static struct ble_npl_callout s_adv_retry;
+static struct ble_npl_callout s_assignment_retry;
 
 static volatile uint32_t s_rx_unsupported;
 static volatile uint32_t s_tx_sent;
@@ -130,9 +137,30 @@ static void notify_port_assignment(uint16_t conn_handle, uint8_t cable_num)
         (uint8_t)(cable_num & 0x01),
     };
     struct os_mbuf *om = ble_hs_mbuf_from_flat(pkt, sizeof(pkt));
-    if (om != NULL) {
-        (void)ble_gatts_notify_custom(conn_handle, s_midi_chr_val_handle, om);
+    int rc = om != NULL ? ble_gatts_notify_custom(conn_handle, s_midi_chr_val_handle, om) : BLE_HS_ENOMEM;
+    portENTER_CRITICAL(&s_slots_lock);
+    int slot = find_slot_by_conn_handle_locked(conn_handle);
+    if (slot >= 0) s_slots[slot].assignment_pending = rc != 0;
+    portEXIT_CRITICAL(&s_slots_lock);
+    if (rc != 0) ble_npl_callout_reset(&s_assignment_retry, ble_npl_time_ms_to_ticks32(50));
+}
+
+static void retry_assignments(struct ble_npl_event *event)
+{
+    (void)event;
+    for (int i = 0; i < BLE_MIDI_MAX_PORTS; i++) {
+        portENTER_CRITICAL(&s_slots_lock);
+        ble_midi_slot_t slot = s_slots[i];
+        portEXIT_CRITICAL(&s_slots_lock);
+        if (slot.connected && slot.notify_enabled && slot.assignment_pending)
+            notify_port_assignment(slot.conn_handle, slot.cable_num);
     }
+}
+
+static void retry_advertising(struct ble_npl_event *event)
+{
+    (void)event;
+    start_advertising_if_needed();
 }
 
 static void bind_slot_to_cable(int slot_idx, uint8_t desired_cable, bool force_claim)
@@ -168,7 +196,7 @@ static void bind_slot_to_cable(int slot_idx, uint8_t desired_cable, bool force_c
 
     const uint8_t other_old_cable = other_idx >= 0 ? s_slots[other_idx].cable_num : 0;
 
-    if (other_idx >= 0 && !force_claim && s_slots[other_idx].explicit_claim) {
+    if (other_idx >= 0 && !force_claim) {
         /*
          * F-02 / F-03 防护：目标端口已被另一台正在演出的手机显式认领，
          * 且本次仅是连接/重连时的自动握手（!force_claim），拒绝抢占并分配空闲端口。
@@ -198,7 +226,6 @@ static void bind_slot_to_cable(int slot_idx, uint8_t desired_cable, bool force_c
     self_handle = s_slots[slot_idx].conn_handle;
     self_cable = s_slots[slot_idx].cable_num;
     self_notify = s_slots[slot_idx].notify_enabled;
-    portEXIT_CRITICAL(&s_slots_lock);
 
     /* 端口归属变化：让桥接层释放该端口上旧手机的余音，避免 Note Off 错发到新手机。 */
     for (uint8_t c = 0; c < BLE_MIDI_MAX_PORTS; c++) {
@@ -206,6 +233,7 @@ static void bind_slot_to_cable(int slot_idx, uint8_t desired_cable, bool force_c
             s_cable_generation[c] = s_cable_generation[c] + 1;
         }
     }
+    portEXIT_CRITICAL(&s_slots_lock);
 
     if (rejected) {
         ESP_LOGW(TAG, "slot=%d handle=%u auto-claim Port %u rejected (in use); assigned Port %u",
@@ -297,12 +325,11 @@ static void parse_ble_midi_packet(int slot_idx, const uint8_t *data, uint16_t le
         }
         idx++; /* timestamp low byte */
 
-        while (idx < len && data[idx] >= 0xF8) {
+        if (idx >= len) break;
+        if (data[idx] >= 0xF8) {
             uint8_t rt = data[idx++];
             dispatch_ble_midi_message(slot_idx, &rt, 1);
-        }
-        if (idx >= len) {
-            break;
+            continue; /* Next message starts with its own timestamp. */
         }
 
         uint8_t b0 = data[idx];
@@ -483,6 +510,7 @@ static void start_advertising_if_needed(void)
         return;
     }
     if (connected_slot_count() >= BLE_MIDI_MAX_PORTS) {
+        ble_npl_callout_stop(&s_adv_retry);
         /* 两台手机均已连上，不开启广播（0 广播开销） */
         if (ble_gap_ext_adv_active(BLE_ADV_INSTANCE)) {
             ble_gap_ext_adv_stop(BLE_ADV_INSTANCE);
@@ -493,9 +521,13 @@ static void start_advertising_if_needed(void)
         return;
     }
 
+    /* Allocation/controller failures should not leave reconnection unavailable. */
+    ble_npl_callout_reset(&s_adv_retry, ble_npl_time_ms_to_ticks32(1000));
     struct ble_gap_ext_adv_params adv_params;
     memset(&adv_params, 0, sizeof(adv_params));
     adv_params.connectable = 1;
+    adv_params.scannable = 1;
+    adv_params.legacy_pdu = 1;
     adv_params.own_addr_type = s_own_addr_type;
     adv_params.primary_phy = BLE_HCI_LE_PHY_1M;
     adv_params.secondary_phy = BLE_HCI_LE_PHY_1M;
@@ -533,11 +565,20 @@ static void start_advertising_if_needed(void)
         return;
     }
 
+    struct os_mbuf *rsp = ble_hs_mbuf_from_flat(s_scan_rsp_data, sizeof(s_scan_rsp_data));
+    if (rsp == NULL) return;
+    rc = ble_gap_ext_adv_rsp_set_data(BLE_ADV_INSTANCE, rsp);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "scan response failed rc=%d", rc);
+        return;
+    }
+
     rc = ble_gap_ext_adv_start(BLE_ADV_INSTANCE, 0, 0);
     if (rc != 0 && rc != BLE_HS_EALREADY) {
         ESP_LOGE(TAG, "ext_adv_start failed rc=%d", rc);
         return;
     }
+    ble_npl_callout_stop(&s_adv_retry);
     ESP_LOGI(TAG, "advertising as %s (connected=%d/%d)",
              BLE_DEVICE_NAME, connected_slot_count(), BLE_MIDI_MAX_PORTS);
 }
@@ -573,6 +614,7 @@ static int ble_midi_gap_event(struct ble_gap_event *event, void *arg)
             s_slots[slot_idx].conn_handle = handle;
             s_slots[slot_idx].mtu = 23;
             s_slots[slot_idx].cable_num = default_cable;
+            s_cable_generation[default_cable]++;
             total_connected = connected_slot_count_locked();
         }
         portEXIT_CRITICAL(&s_slots_lock);
@@ -612,6 +654,7 @@ static int ble_midi_gap_event(struct ble_gap_event *event, void *arg)
         slot_idx = find_slot_by_conn_handle_locked(handle);
         if (slot_idx >= 0) {
             old_cable = s_slots[slot_idx].cable_num;
+            s_cable_generation[old_cable]++;
             memset(&s_slots[slot_idx], 0, sizeof(s_slots[slot_idx]));
         }
         portEXIT_CRITICAL(&s_slots_lock);
@@ -631,6 +674,9 @@ static int ble_midi_gap_event(struct ble_gap_event *event, void *arg)
             portENTER_CRITICAL(&s_slots_lock);
             slot_idx = find_slot_by_conn_handle_locked(event->subscribe.conn_handle);
             if (slot_idx >= 0) {
+                if (s_slots[slot_idx].notify_enabled != enabled) {
+                    s_cable_generation[s_slots[slot_idx].cable_num]++;
+                }
                 s_slots[slot_idx].notify_enabled = enabled;
                 cable_num = s_slots[slot_idx].cable_num;
             }
@@ -677,6 +723,10 @@ static void ble_midi_on_reset(int reason)
 {
     ESP_LOGW(TAG, "NimBLE reset reason=%d", reason);
     s_synced = false;
+    portENTER_CRITICAL(&s_slots_lock);
+    memset(s_slots, 0, sizeof(s_slots));
+    for (int c = 0; c < BLE_MIDI_MAX_PORTS; c++) s_cable_generation[c]++;
+    portEXIT_CRITICAL(&s_slots_lock);
 }
 
 static void ble_midi_on_sync(void)
@@ -719,6 +769,8 @@ esp_err_t ble_midi_link_init(ble_midi_rx_cb_t cb)
     ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
     ble_hs_cfg.sm_sc = 1;
 
+    ble_npl_callout_init(&s_adv_retry, nimble_port_get_dflt_eventq(), retry_advertising, NULL);
+    ble_npl_callout_init(&s_assignment_retry, nimble_port_get_dflt_eventq(), retry_assignments, NULL);
     ble_svc_gap_init();
     ble_svc_gatt_init();
 
@@ -741,7 +793,8 @@ esp_err_t ble_midi_link_init(ble_midi_rx_cb_t cb)
 esp_err_t ble_midi_link_start(void)
 {
     s_start_requested = true;
-    start_advertising_if_needed();
+    /* All advertising operations run on the NimBLE host event queue. */
+    ble_npl_callout_reset(&s_adv_retry, 1);
     return ESP_OK;
 }
 
@@ -764,7 +817,10 @@ uint32_t ble_midi_link_cable_generation(uint8_t cable_num)
     if (cable_num >= BLE_MIDI_MAX_PORTS) {
         return 0;
     }
-    return s_cable_generation[cable_num];
+    portENTER_CRITICAL(&s_slots_lock);
+    uint32_t generation = s_cable_generation[cable_num];
+    portEXIT_CRITICAL(&s_slots_lock);
+    return generation;
 }
 
 esp_err_t ble_midi_link_send(uint8_t cable_num, const uint8_t *const msgs[], const uint8_t lens[], uint16_t count)
@@ -843,7 +899,7 @@ esp_err_t ble_midi_link_send(uint8_t cable_num, const uint8_t *const msgs[], con
     if (count > sent_msgs) {
         s_tx_dropped += (uint32_t)(count - sent_msgs);
     }
-    return sent_msgs > 0 ? ESP_OK : ESP_FAIL;
+    return sent_msgs == count ? ESP_OK : ESP_FAIL;
 }
 
 void ble_midi_link_get_stats(ble_midi_link_stats_t *out)

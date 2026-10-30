@@ -672,6 +672,47 @@ class ControllerStoreTest {
         assertEquals(72, store.state.value.controls.first { it.id == button.id }.mapping.number)
     }
 
+    @Test
+    fun deletingHeldButtonReleasesItsOriginalNote() = runTest {
+        val transport = FakeTransport()
+        val store = ControllerStore(transport, InMemoryLayoutStore(), backgroundScope)
+        runCurrent()
+        store.ensureDefaultStrips()
+        val button = store.state.value.controls[4]
+        store.buttonDown(button.id)
+        store.deleteControl(button.id)
+        assertEquals(listOf(MidiMessage.noteOff(button.mapping.channel, button.mapping.number)), transport.sent.last())
+    }
+
+    @Test
+    fun editingHeldButtonReleasesOldMappingBeforeReplacement() = runTest {
+        val transport = FakeTransport()
+        val store = ControllerStore(transport, InMemoryLayoutStore(), backgroundScope)
+        runCurrent()
+        store.ensureDefaultStrips()
+        val button = store.state.value.controls[4]
+        store.buttonDown(button.id)
+        store.upsertControl(button.copy(mapping = button.mapping.copy(number = 90)))
+        assertEquals(listOf(MidiMessage.noteOff(button.mapping.channel, button.mapping.number)), transport.sent.last())
+    }
+
+    @Test
+    fun manualPortSwitchDoesNotOverwriteDawWithOldValues() = runTest {
+        val transport = FakeTransport()
+        val store = ControllerStore(transport, InMemoryLayoutStore(), backgroundScope)
+        runCurrent()
+        store.ensureDefaultStrips()
+        transport.emit(TransportEvent.ConnectionChanged(com.remoteesp32midi.glassmidi.ble.BleConnection(
+            phase = com.remoteesp32midi.glassmidi.ble.ConnectionPhase.READY)))
+        runCurrent()
+        store.setContinuousValue(store.state.value.controls[0].id, 15000)
+        transport.sent.clear()
+        store.setDevicePort(1)
+        advanceTimeBy(20)
+        runCurrent()
+        assertEquals(listOf(listOf(MidiMessage.portSelect(1, force = true))), transport.sent)
+    }
+
     private fun androidxMidiMapping(
         type: MidiType,
         channel: Int,

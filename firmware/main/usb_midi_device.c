@@ -112,10 +112,22 @@ bool usb_midi_device_mounted(void)
 
 uint32_t usb_midi_write(uint8_t cable_num, const uint8_t *data, uint32_t len)
 {
-    if (data == NULL || len == 0 || cable_num >= USB_MIDI_CABLE_COUNT || !tud_midi_mounted()) {
+    if (data == NULL || len == 0 || len > 3 || cable_num >= USB_MIDI_CABLE_COUNT || !tud_midi_mounted()) {
         return 0;
     }
-    return tud_midi_stream_write(cable_num, data, len);
+    /* The stream API keeps one shared partial-message state for both cables.
+     * Complete event packets make the cable and message an atomic FIFO write. */
+    uint8_t cin;
+    if (data[0] < 0xF0) {
+        cin = data[0] >> 4;
+    } else if (data[0] >= 0xF8) {
+        cin = 0x0F;
+    } else {
+        cin = len == 3 ? 0x03 : (len == 2 ? 0x02 : 0x05);
+    }
+    uint8_t packet[4] = { (uint8_t)((cable_num << 4) | cin), 0, 0, 0 };
+    for (uint32_t i = 0; i < len; i++) packet[i + 1] = data[i];
+    return tud_midi_packet_write(packet) ? len : 0;
 }
 
 uint32_t usb_midi_read_packets(uint8_t *packets, uint32_t max_packets)

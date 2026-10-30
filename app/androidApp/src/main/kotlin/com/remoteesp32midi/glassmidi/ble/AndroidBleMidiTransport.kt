@@ -19,6 +19,9 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.SystemClock
 import android.util.Log
+import com.remoteesp32midi.glassmidi.midi.MidiSendQueue
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeoutOrNull
 import com.remoteesp32midi.glassmidi.midi.BleMidiCodec
 import com.remoteesp32midi.glassmidi.model.MidiMessage
 import java.util.UUID
@@ -66,14 +69,11 @@ class AndroidBleMidiTransport(
     )
     override val incoming: Flow<List<MidiMessage>> = _incoming.asSharedFlow()
 
-    // F-06：高优先级通道（Note On/Off、端口握手）与连续控制通道分离，
-    // 确保多指快速拖动推子时按下的 Note 绝不会被排在几十帧 CC 后面；
-    // 连续通道使用 DROP_OLDEST，极端拥塞时自动淘汰过期的中间推子帧。
-    private val prioritySendQueue = Channel<ByteArray>(capacity = 64)
-    private val continuousSendQueue = Channel<ByteArray>(
-        capacity = 128,
-        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
-    )
+    private val queueLock = Any()
+    private val sendQueue = MidiSendQueue()
+    @Volatile private var negotiatedMtu = 23
+    @Volatile private var sessionGeneration = 0L
+    @Volatile private var writeCompletion: CompletableDeferred<Int>? = null
     private val sendSignal = Channel<Unit>(capacity = Channel.CONFLATED)
     private val writeMutex = Mutex()
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -95,11 +95,12 @@ class AndroidBleMidiTransport(
         scope.launch(writeDispatcher) {
             for (signal in sendSignal) {
                 while (true) {
-                    val priorityPacket = prioritySendQueue.tryReceive().getOrNull()
-                    val packet = priorityPacket
-                        ?: continuousSendQueue.tryReceive().getOrNull()
-                        ?: break
-                    writePacket(packet, priorityPacket != null)
+                    val entry = synchronized(queueLock) {
+                        sendQueue.poll(((negotiatedMtu - 4) / 4).coerceIn(2, 8))?.let { it to sessionGeneration }
+                    } ?: break
+                    val packet = codec.encode(entry.first, SystemClock.elapsedRealtime())
+                    val priority = entry.first.any { it.isNoteOn || it.isNoteOff || it.isPortHandshake }
+                    writePacket(packet, priority, entry.second)
                     // Android 的 GATT 操作一次只能有一个；留出连接间隔给协议栈。
                     delay(WRITE_PACING_MS)
                 }
@@ -111,16 +112,12 @@ class AndroidBleMidiTransport(
         if (messages.isEmpty()) return
         // 未 Ready 时不排队：旧按键/旋钮值在重连后重放会造成卡音或状态跳变。
         if (lastConnection.phase != ConnectionPhase.READY) return
-        val packet = codec.encode(messages, SystemClock.elapsedRealtime())
-        val isPriority = messages.any {
-            it.command == 0x80 || it.command == 0x90 || it.isPortHandshake
+        val accepted = synchronized(queueLock) {
+            lastConnection.phase == ConnectionPhase.READY && sendQueue.offer(messages)
         }
-        if (isPriority) {
-            if (!prioritySendQueue.trySend(packet).isSuccess) {
-                _events.tryEmit(TransportEvent.Error("BLE 优先发送队列已满"))
-            }
-        } else {
-            continuousSendQueue.trySend(packet)
+        if (!accepted) {
+            recoverWriteFailure("BLE 发送拥塞，正在重新建立安全连接")
+            return
         }
         sendSignal.trySend(Unit)
     }
@@ -141,6 +138,8 @@ class AndroidBleMidiTransport(
             return
         }
 
+        if (lastConnection.phase in listOf(ConnectionPhase.READY, ConnectionPhase.CONNECTING, ConnectionPhase.RECONNECTING)) return
+        stopScan()
         foundDevices.clear()
         _events.tryEmit(TransportEvent.Devices(emptyList()))
         emitConnection(BleConnection(phase = ConnectionPhase.SCANNING))
@@ -155,12 +154,11 @@ class AndroidBleMidiTransport(
             // UI 线程就会被抢 CPU，表现为未连接也卡顿。配网扫描用 BALANCED
             // 足够，10 秒超时内仍能发现 ESP32。
             .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
-            // 固件用 BLE 5 扩展广播（UUID+名称超过 31 字节）。Android 默认
-            // legacy=true，只回传传统广播，因此这里必须显式接收扩展广播。
-            .setLegacy(false)
-            .setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
+            // Firmware puts its UUID in legacy ADV and name in scan response.
+            // This also works on BLE 4.x Android controllers.
+            .setLegacy(true)
             .build()
-        Log.d(TAG, "startScan legacy=false phy=ALL")
+        Log.d(TAG, "startScan legacy=true")
         scanDevicesDirty = false
         scanPublishJob?.cancel()
         scanPublishJob = scope.launch {
@@ -205,6 +203,8 @@ class AndroidBleMidiTransport(
     @SuppressLint("MissingPermission")
     override fun connect(address: String) {
         stopScan()
+        reconnectJob?.cancel()
+        reconnectJob = null
         desiredAddress = address
         manualDisconnect = false
         retryAttempt = 0
@@ -234,6 +234,10 @@ class AndroidBleMidiTransport(
             return
         }
         closeGatt()
+        if (!adapter.isEnabled) {
+            scheduleReconnect()
+            return
+        }
         midiCharacteristic = null
         val device = try {
             adapter.getRemoteDevice(address)
@@ -249,11 +253,10 @@ class AndroidBleMidiTransport(
             )
         )
         startConnectWatchdog(address, autoConnect)
-        gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        gatt = runCatching {
             device.connectGatt(context, autoConnect, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } else {
-            device.connectGatt(context, autoConnect, gattCallback)
-        }
+        }.getOrNull()
+        if (gatt == null) scheduleReconnect()
     }
 
     private fun startConnectWatchdog(address: String, autoConnect: Boolean) {
@@ -304,7 +307,7 @@ class AndroidBleMidiTransport(
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             Log.d(TAG, "conn state status=$status newState=$newState address=${gatt.device.address}")
             if (gatt !== this@AndroidBleMidiTransport.gatt) {
-                gatt.close()
+                runCatching { gatt.close() }
                 return
             }
             if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
@@ -319,8 +322,8 @@ class AndroidBleMidiTransport(
                 // 否则 autoConnect 慢到接近超时时，会在 MTU/发现服务过程中被自己掐断。
                 startConnectWatchdog(gatt.device.address, autoConnect = false)
                 runCatching { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) }
-                if (!gatt.requestMtu(MTU_REQUEST)) {
-                    gatt.discoverServices()
+                if (!runCatching { gatt.requestMtu(MTU_REQUEST) }.getOrDefault(false)) {
+                    if (!runCatching { gatt.discoverServices() }.getOrDefault(false)) recoverWriteFailure("无法发现 BLE 服务")
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 closeGatt()
@@ -335,6 +338,7 @@ class AndroidBleMidiTransport(
         @SuppressLint("MissingPermission")
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             if (gatt !== this@AndroidBleMidiTransport.gatt) return
+            negotiatedMtu = if (status == BluetoothGatt.GATT_SUCCESS) mtu.coerceAtLeast(23) else 23
             if (!gatt.discoverServices()) {
                 publishError("无法发现 BLE 服务")
             }
@@ -414,12 +418,22 @@ class AndroidBleMidiTransport(
             )
         }
 
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int,
+        ) {
+            if (gatt === this@AndroidBleMidiTransport.gatt && characteristic.uuid == CHARACTERISTIC_UUID) {
+                writeCompletion?.complete(status)
+            }
+        }
+
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray,
         ) {
-            handleNotification(characteristic, value)
+            if (gatt === this@AndroidBleMidiTransport.gatt) handleNotification(characteristic, value)
         }
 
         @Suppress("DEPRECATION")
@@ -428,7 +442,7 @@ class AndroidBleMidiTransport(
             characteristic: BluetoothGattCharacteristic,
         ) {
             val value = characteristic.value ?: return
-            handleNotification(characteristic, value)
+            if (gatt === this@AndroidBleMidiTransport.gatt) handleNotification(characteristic, value)
         }
     }
 
@@ -454,16 +468,17 @@ class AndroidBleMidiTransport(
         val messages = runCatching { codec.decode(value) }.getOrElse {
             return
         }
+        if (messages.any { it.isPortHandshake }) clearSendQueue()
         if (messages.isNotEmpty()) {
             _incoming.tryEmit(messages)
         }
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun writePacket(packet: ByteArray, priority: Boolean) {
+    private suspend fun writePacket(packet: ByteArray, priority: Boolean, generation: Long) {
         val gatt = gatt ?: return
         val characteristic = midiCharacteristic ?: return
-        if (lastConnection.phase != ConnectionPhase.READY) return
+        if (lastConnection.phase != ConnectionPhase.READY || generation != sessionGeneration) return
 
         // Note / 端口握手比 CC 重要得多：丢一帧 CC 只是参数跳一下，丢一条 Note Off 就是永久卡音。
         val retries = if (priority) PRIORITY_WRITE_RETRIES else WRITE_RETRIES
@@ -473,17 +488,27 @@ class AndroidBleMidiTransport(
             while (attempt < retries) {
                 // 断开/切换中不要对着已关闭的 gatt 空转，也不要弹假的"写入失败"。
                 if (this@AndroidBleMidiTransport.gatt !== gatt ||
-                    lastConnection.phase != ConnectionPhase.READY
+                    lastConnection.phase != ConnectionPhase.READY || generation != sessionGeneration
                 ) {
                     return
                 }
+                val completion = CompletableDeferred<Int>()
+                writeCompletion = completion
                 val accepted = writeCharacteristic(gatt, characteristic, packet)
-                if (accepted) return
+                if (accepted) {
+                    val status = withTimeoutOrNull(WRITE_TIMEOUT_MS) { completion.await() }
+                    if (writeCompletion === completion) writeCompletion = null
+                    if (status != BluetoothGatt.GATT_SUCCESS && this@AndroidBleMidiTransport.gatt === gatt) {
+                        recoverWriteFailure("BLE 写入未完成，正在重连")
+                    }
+                    return
+                }
+                if (writeCompletion === completion) writeCompletion = null
                 delay(WRITE_RETRY_DELAY_MS)
                 attempt++
             }
             if (lastConnection.phase == ConnectionPhase.READY) {
-                publishError("BLE 写入失败")
+                recoverWriteFailure("BLE 写入失败，正在重连")
             }
         }
     }
@@ -542,10 +567,13 @@ class AndroidBleMidiTransport(
     private fun closeGatt() {
         connectTimeoutJob?.cancel()
         connectTimeoutJob = null
+        writeCompletion?.complete(BluetoothGatt.GATT_FAILURE)
+        writeCompletion = null
         clearSendQueue()
         val current = gatt
         gatt = null
         midiCharacteristic = null
+        negotiatedMtu = 23
         if (current != null) {
             runCatching { current.disconnect() }
             runCatching { current.close() }
@@ -553,11 +581,20 @@ class AndroidBleMidiTransport(
     }
 
     private fun clearSendQueue() {
-        while (prioritySendQueue.tryReceive().isSuccess) {
-            // 清空断线前排队的旧状态。
+        synchronized(queueLock) {
+            sessionGeneration++
+            sendQueue.clear()
         }
-        while (continuousSendQueue.tryReceive().isSuccess) {
-            // 清空断线前排队的旧状态。
+    }
+
+    private fun recoverWriteFailure(message: String) {
+        val failedGatt = gatt
+        val failedGeneration = sessionGeneration
+        scope.launch {
+            if (manualDisconnect || gatt !== failedGatt || sessionGeneration != failedGeneration) return@launch
+            publishError(message)
+            closeGatt()
+            scheduleReconnect()
         }
     }
 
@@ -606,6 +643,7 @@ class AndroidBleMidiTransport(
         private const val CONNECT_TIMEOUT_MS = 10_000L
         private const val RECONNECT_TIMEOUT_MS = 30_000L
         private const val DEVICE_PUBLISH_INTERVAL_MS = 250L
+        private const val WRITE_TIMEOUT_MS = 1_500L
         private const val WRITE_PACING_MS = 3L
         private const val WRITE_RETRY_DELAY_MS = 4L
         private const val WRITE_RETRIES = 5

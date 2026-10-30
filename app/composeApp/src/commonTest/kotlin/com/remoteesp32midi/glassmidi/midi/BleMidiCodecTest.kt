@@ -78,6 +78,15 @@ class BleMidiCodecTest {
     }
 
     @Test
+    fun clockInsideNotificationDoesNotDiscardControllerFeedback() {
+        val packet = byteArrayOf(0x80.toByte(), 0x80.toByte(), 0xF8.toByte(),
+            0x80.toByte(), 0xB0.toByte(), 7, 100,
+            0x80.toByte(), 0xFE.toByte(), 0x80.toByte(), 7, 0)
+        assertEquals(listOf(MidiMessage.controlChange(1, 7, 100),
+            MidiMessage.controlChange(1, 7, 0)), codec.decode(packet))
+    }
+
+    @Test
     fun malformedDataByteIsRejected() {
         assertFailsWith<IllegalArgumentException> {
             codec.decode(byteArrayOf(0x80.toByte(), 0x80.toByte(), 0x90.toByte(), 0x3C))
