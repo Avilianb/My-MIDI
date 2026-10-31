@@ -14,6 +14,8 @@ import com.remoteesp32midi.glassmidi.model.PersistedState
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -21,9 +23,10 @@ import org.json.JSONObject
  * layout.json 存在 App 私有目录；AtomicFile 保证写入不会留下半个文件。
  */
 class AndroidLayoutStore(context: Context) : LayoutStore {
+    private val ioMutex = Mutex()
     private val file = AtomicFile(File(context.applicationContext.filesDir, FILE_NAME))
 
-    override suspend fun load(): PersistedState = withContext(Dispatchers.IO) {
+    override suspend fun load(): PersistedState = ioMutex.withLock { withContext(Dispatchers.IO) {
         if (!file.baseFile.exists()) return@withContext PersistedState()
         runCatching {
             val root = JSONObject(file.readFully().decodeToString())
@@ -43,9 +46,9 @@ class AndroidLayoutStore(context: Context) : LayoutStore {
                 mappingSchemeVersion = root.optInt("mappingSchemeVersion", 0),
             )
         }.getOrElse { PersistedState() }
-    }
+    } }
 
-    override suspend fun save(state: PersistedState) = withContext(Dispatchers.IO) {
+    override suspend fun save(state: PersistedState) = ioMutex.withLock { withContext(Dispatchers.IO) {
         val root = JSONObject().apply {
             put("schemaVersion", SCHEMA_VERSION)
             put("deviceAddress", state.deviceAddress ?: "")
@@ -93,7 +96,7 @@ class AndroidLayoutStore(context: Context) : LayoutStore {
             file.failWrite(output)
             throw error
         }
-    }
+    } }
 
     private fun JSONArray.toControls(): List<Control> {
         val result = ArrayList<Control>(length())

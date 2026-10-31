@@ -86,6 +86,12 @@ const val CONTROLS_PER_STRIP = 6
 /** 旧布局(每条 1 Fader + 3 Knob + 1 Button)的控件数,只用于一次性迁移。 */
 const val LEGACY_CONTROLS_PER_STRIP = 5
 const val DEFAULT_STRIP_COUNT = 4
+const val MAX_PLAYER_STRIPS = 8
+
+/** Actual channel learned by Live; firmware translates local BLE channels. */
+fun usbMidiChannel(devicePort: Int, localChannel: Int): Int =
+    devicePort.coerceIn(0, 1) * MAX_PLAYER_STRIPS + localChannel
+
 
 data class ChannelStrip(
     val index: Int,

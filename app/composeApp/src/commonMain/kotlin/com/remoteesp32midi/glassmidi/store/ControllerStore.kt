@@ -5,6 +5,7 @@ import com.remoteesp32midi.glassmidi.ble.BleDevice
 import com.remoteesp32midi.glassmidi.ble.BleMidiTransport
 import com.remoteesp32midi.glassmidi.ble.ConnectionPhase
 import com.remoteesp32midi.glassmidi.ble.TransportEvent
+import com.remoteesp32midi.glassmidi.model.MAX_PLAYER_STRIPS
 import com.remoteesp32midi.glassmidi.model.CONTROLS_PER_STRIP
 import com.remoteesp32midi.glassmidi.model.LEGACY_CONTROLS_PER_STRIP
 import com.remoteesp32midi.glassmidi.model.ButtonBehavior
@@ -68,6 +69,7 @@ class ControllerStore(
     private val suppressedContinuousIds = mutableSetOf<String>()
     private val echoSuppressionJobs = mutableMapOf<String, Job>()
     private var saveJob: Job? = null
+    private val soundingButtons = mutableMapOf<String, Control>()
 
     init {
         scope.launch {
@@ -99,6 +101,8 @@ class ControllerStore(
                     lastDeviceName = persisted.deviceName,
                     devicePort = persisted.devicePort.coerceIn(0, 1),
                     loaded = true,
+                    error = if (controls.isChannelStripLayout() && controls.size > MAX_PLAYER_STRIPS * CONTROLS_PER_STRIP)
+                        "现有布局超过每人 8 条上限，请删除多余通道后使用；原布局已保留" else it.error,
                 )
             }
             if (controls != rawControls || resetToDefaultModes || mappingSchemeOutdated) {
@@ -136,8 +140,9 @@ class ControllerStore(
                             // 只发端口握手（force=false，不抢占另一台手机）。
                             // 不再把本地保存的推子/旋钮值推给 DAW：连接时以 DAW 为准，
                             // 由固件在端口绑定时回放它缓存的 USB 侧最近状态（见 midi_bridge 影子缓存）。
-                            transport.send(listOf(MidiMessage.portSelect(_state.value.devicePort, force = false)))
+                            sendMidi(listOf(MidiMessage.portSelect(_state.value.devicePort, force = false)))
                         } else {
+                            soundingButtons.clear()
                             pendingContinuous.value = emptyMap()
                             pendingFourteenBit.clear()
                             clearEchoSuppression()
@@ -168,6 +173,10 @@ class ControllerStore(
     }
 
     fun startScan() {
+        // A stale/double-tapped scan action must not hide a live GATT session.
+        if (_state.value.connection.phase in listOf(
+                ConnectionPhase.READY, ConnectionPhase.CONNECTING, ConnectionPhase.RECONNECTING,
+            )) return
         _state.update {
             it.copy(
                 scanning = true,
@@ -225,6 +234,10 @@ class ControllerStore(
         }
     }
 
+    fun reportError(message: String) {
+        _state.update { it.copy(error = message) }
+    }
+
     fun clearError() {
         _state.update { it.copy(error = null) }
     }
@@ -233,12 +246,11 @@ class ControllerStore(
     fun setDevicePort(portIndex: Int) {
         val normalized = portIndex.coerceIn(0, 1)
         if (_state.value.devicePort == normalized) return
+        resetPortState()
         _state.update { it.copy(devicePort = normalized) }
         if (_state.value.connection.phase == ConnectionPhase.READY) {
-            transport.send(listOf(MidiMessage.portSelect(normalized, force = true)))
-            _state.value.controls
-                .filter { it.kind != ControlKind.BUTTON }
-                .forEach { sendContinuous(it, it.value) }
+            sendMidi(listOf(MidiMessage.portSelect(normalized, force = true)))
+
         }
         scheduleSave()
     }
@@ -248,11 +260,19 @@ class ControllerStore(
         val normalized = candidate.withDefaultLabel(_state.value.controls).let {
             if (it.id.isBlank()) it.copy(id = newId()) else it
         }
+        if (normalized.mapping.channel !in 1..MAX_PLAYER_STRIPS)
+            return "每位乐手使用本地通道 1–8，实际 MIDI 通道由乐手端口决定"
         val value = normalized.value.coerceIn(normalized.kind.valueRange())
-        val control = normalized.copy(value = value)
+        var control = normalized.copy(value = value)
         val error = validateControl(control, _state.value.controls)
         if (error != null) return error
 
+        val previous = _state.value.controls.firstOrNull { it.id == control.id }
+        if (previous != null && (previous.mapping != control.mapping || previous.buttonBehavior != control.buttonBehavior)) {
+            releaseButton(previous.id)
+            if (control.kind == ControlKind.BUTTON) control = control.copy(value = 0)
+            pendingContinuous.update { it - previous.id }
+        }
         _state.update { current ->
             val existingIndex = current.controls.indexOfFirst { it.id == control.id }
             val controls = if (existingIndex >= 0) {
@@ -267,6 +287,7 @@ class ControllerStore(
     }
 
     fun deleteControl(id: String) {
+        releaseButton(id)
         _state.update { current ->
             current.copy(controls = current.controls.filterNot { it.id == id })
         }
@@ -300,10 +321,11 @@ class ControllerStore(
      * 若已有控件不是通道条结构，则保留原有控件并补齐为至少 [minStrips] 条通道。
      */
     fun ensureDefaultStrips(minStrips: Int = DEFAULT_STRIP_COUNT) {
+        val minimum = minStrips.coerceIn(1, MAX_PLAYER_STRIPS)
         val current = _state.value.controls
-        if (current.hasPresetStripMappings() && current.size >= minStrips * CONTROLS_PER_STRIP) return
+        if (current.hasPresetStripMappings() && current.size >= minimum * CONTROLS_PER_STRIP) return
 
-        if (current.isChannelStripLayout() && current.size >= minStrips * CONTROLS_PER_STRIP) {
+        if (current.isChannelStripLayout() && current.size >= minimum * CONTROLS_PER_STRIP) {
             val normalized = applyPresetMappings(current)
             val stripCount = normalized.size / CONTROLS_PER_STRIP
             _state.update {
@@ -325,7 +347,7 @@ class ControllerStore(
             (knobs.size + 2) / 3,
             (buttons.size + 1) / 2,
         )
-        val stripCount = maxOf(minStrips, neededByExisting)
+        val stripCount = maxOf(minimum, neededByExisting)
         val built = ArrayList<Control>(stripCount * CONTROLS_PER_STRIP)
 
         for (stripIdx in 0 until stripCount) {
@@ -354,6 +376,10 @@ class ControllerStore(
 
     fun addChannelStrip(): Int {
         ensureDefaultStrips()
+        if (_state.value.controls.size / CONTROLS_PER_STRIP >= MAX_PLAYER_STRIPS) {
+            reportError("每位乐手最多 8 条通道；乐手 1 使用 MIDI 1–8，乐手 2 使用 MIDI 9–16")
+            return (_state.value.controls.size / CONTROLS_PER_STRIP - 1).coerceAtLeast(0)
+        }
         var newStripIndex = 0
         _state.update { current ->
             val stripIndex = current.controls.size / CONTROLS_PER_STRIP
@@ -374,6 +400,8 @@ class ControllerStore(
     }
 
     fun deleteChannelStrip(stripIndex: Int) {
+        releaseAllButtons()
+        pendingContinuous.value = emptyMap()
         var removedIds: List<String> = emptyList()
         _state.update { current ->
             val stripCount = current.controls.size / CONTROLS_PER_STRIP
@@ -402,6 +430,8 @@ class ControllerStore(
 
     fun moveChannelStrip(fromStripIndex: Int, toStripIndex: Int) {
         if (fromStripIndex == toStripIndex) return
+        releaseAllButtons()
+        pendingContinuous.value = emptyMap()
         var moved = false
         _state.update { current ->
             val stripCount = current.controls.size / CONTROLS_PER_STRIP
@@ -530,6 +560,39 @@ class ControllerStore(
         return result
     }
 
+    private fun sendMidi(messages: List<MidiMessage>) {
+        val controls = _state.value.controls
+        if (messages.none { it.isPortHandshake } && controls.isChannelStripLayout() &&
+            controls.size > MAX_PLAYER_STRIPS * CONTROLS_PER_STRIP) {
+            reportError("现有布局超过每人 8 条上限，请删除多余通道后使用；原布局已保留")
+            return
+        }
+        transport.send(messages)
+    }
+
+    private fun releaseButton(id: String) {
+        val control = soundingButtons.remove(id) ?: return
+        val message = when (control.mapping.type) {
+            MidiType.NOTE -> MidiMessage.noteOff(control.mapping.channel, control.mapping.number)
+            MidiType.CC -> MidiMessage.controlChange(control.mapping.channel, control.mapping.number, 0)
+            MidiType.PITCH_BEND -> return
+        }
+        sendMidi(listOf(message))
+        updateValue(id, 0)
+    }
+
+    private fun releaseAllButtons() = soundingButtons.keys.toList().forEach { releaseButton(it) }
+
+    private fun resetPortState() {
+        soundingButtons.clear() // Firmware panics the old cable when ownership changes.
+        pendingContinuous.value = emptyMap()
+        pendingFourteenBit.clear()
+        clearEchoSuppression()
+        _state.update { current -> current.copy(controls = current.controls.map {
+            if (it.kind == ControlKind.BUTTON) it.copy(value = 0) else it
+        }) }
+    }
+
     fun buttonDown(id: String) {
         val control = _state.value.controls.find { it.id == id } ?: return
         if (control.kind != ControlKind.BUTTON) return
@@ -548,8 +611,9 @@ class ControllerStore(
                 )
                 MidiType.PITCH_BEND -> return
             }
+            if (nextValue > 0) soundingButtons[id] = control else soundingButtons.remove(id)
             updateValue(id, nextValue)
-            transport.send(listOf(message))
+            sendMidi(listOf(message))
             scheduleSave()
             return
         }
@@ -558,8 +622,9 @@ class ControllerStore(
             MidiType.CC -> MidiMessage.controlChange(control.mapping.channel, control.mapping.number, 127)
             MidiType.PITCH_BEND -> return
         }
+        soundingButtons[id] = control
         updateValue(id, 127)
-        transport.send(listOf(message))
+        sendMidi(listOf(message))
     }
 
     fun buttonUp(id: String) {
@@ -571,8 +636,9 @@ class ControllerStore(
             MidiType.CC -> MidiMessage.controlChange(control.mapping.channel, control.mapping.number, 0)
             MidiType.PITCH_BEND -> return
         }
+        soundingButtons.remove(id)
         updateValue(id, 0)
-        transport.send(listOf(message))
+        sendMidi(listOf(message))
         scheduleSave()
     }
 
@@ -642,6 +708,7 @@ class ControllerStore(
             if (message.isPortHandshake) {
                 val assignedPort = message.handshakePortIndex
                 if (_state.value.devicePort != assignedPort) {
+                    resetPortState()
                     _state.update { it.copy(devicePort = assignedPort) }
                     changed = true
                     // 端口变了也不推值：新端口以 DAW 为准，固件会在绑定后回放该端口的影子状态。
@@ -785,7 +852,7 @@ class ControllerStore(
             // 将同一 10ms 节流窗口内所有推子/旋钮变动打包进标准 BLE-MIDI 多消息帧（最多 8 条/包），
             // 多指同拖 4 根推子时包率依然恒定 ≤ 100 包/s，消除写队列积压。
             allMessages.chunked(MAX_MESSAGES_PER_PACKET).forEach { batch ->
-                transport.send(batch)
+                sendMidi(batch)
             }
         }
     }
@@ -793,7 +860,7 @@ class ControllerStore(
     private fun sendContinuous(control: Control, value: Int) {
         val messages = continuousMessages(control, value)
         if (messages.isNotEmpty()) {
-            transport.send(messages)
+            sendMidi(messages)
         }
     }
 

@@ -11,6 +11,10 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothStatusCodes
+import android.bluetooth.le.ScanFilter
+import android.os.Handler
+import android.os.Looper
+import android.os.ParcelUuid
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
@@ -19,6 +23,9 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.SystemClock
 import android.util.Log
+import com.remoteesp32midi.glassmidi.midi.MidiSendQueue
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeoutOrNull
 import com.remoteesp32midi.glassmidi.midi.BleMidiCodec
 import com.remoteesp32midi.glassmidi.model.MidiMessage
 import java.util.UUID
@@ -66,14 +73,11 @@ class AndroidBleMidiTransport(
     )
     override val incoming: Flow<List<MidiMessage>> = _incoming.asSharedFlow()
 
-    // F-06：高优先级通道（Note On/Off、端口握手）与连续控制通道分离，
-    // 确保多指快速拖动推子时按下的 Note 绝不会被排在几十帧 CC 后面；
-    // 连续通道使用 DROP_OLDEST，极端拥塞时自动淘汰过期的中间推子帧。
-    private val prioritySendQueue = Channel<ByteArray>(capacity = 64)
-    private val continuousSendQueue = Channel<ByteArray>(
-        capacity = 128,
-        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
-    )
+    private val queueLock = Any()
+    private val sendQueue = MidiSendQueue()
+    @Volatile private var negotiatedMtu = 23
+    @Volatile private var sessionGeneration = 0L
+    @Volatile private var writeCompletion: CompletableDeferred<Int>? = null
     private val sendSignal = Channel<Unit>(capacity = Channel.CONFLATED)
     private val writeMutex = Mutex()
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -95,11 +99,12 @@ class AndroidBleMidiTransport(
         scope.launch(writeDispatcher) {
             for (signal in sendSignal) {
                 while (true) {
-                    val priorityPacket = prioritySendQueue.tryReceive().getOrNull()
-                    val packet = priorityPacket
-                        ?: continuousSendQueue.tryReceive().getOrNull()
-                        ?: break
-                    writePacket(packet, priorityPacket != null)
+                    val entry = synchronized(queueLock) {
+                        sendQueue.poll(((negotiatedMtu - 4) / 4).coerceIn(2, 8))?.let { it to sessionGeneration }
+                    } ?: break
+                    val packet = codec.encode(entry.first, SystemClock.elapsedRealtime())
+                    val priority = entry.first.any { it.isNoteOn || it.isNoteOff || it.isPortHandshake }
+                    writePacket(packet, priority, entry.second)
                     // Android 的 GATT 操作一次只能有一个；留出连接间隔给协议栈。
                     delay(WRITE_PACING_MS)
                 }
@@ -111,16 +116,12 @@ class AndroidBleMidiTransport(
         if (messages.isEmpty()) return
         // 未 Ready 时不排队：旧按键/旋钮值在重连后重放会造成卡音或状态跳变。
         if (lastConnection.phase != ConnectionPhase.READY) return
-        val packet = codec.encode(messages, SystemClock.elapsedRealtime())
-        val isPriority = messages.any {
-            it.command == 0x80 || it.command == 0x90 || it.isPortHandshake
+        val accepted = synchronized(queueLock) {
+            lastConnection.phase == ConnectionPhase.READY && sendQueue.offer(messages)
         }
-        if (isPriority) {
-            if (!prioritySendQueue.trySend(packet).isSuccess) {
-                _events.tryEmit(TransportEvent.Error("BLE 优先发送队列已满"))
-            }
-        } else {
-            continuousSendQueue.trySend(packet)
+        if (!accepted) {
+            recoverWriteFailure("BLE 发送拥塞，正在重新建立安全连接")
+            return
         }
         sendSignal.trySend(Unit)
     }
@@ -129,38 +130,38 @@ class AndroidBleMidiTransport(
     override fun startScan() {
         val adapter = adapter
         if (adapter == null) {
-            publishError("这台设备没有蓝牙适配器")
+            failScan("这台设备没有蓝牙适配器")
             return
         }
         if (!hasScanPermission()) {
-            publishError("缺少蓝牙扫描权限")
+            failScan("缺少蓝牙扫描权限")
             return
         }
         if (!adapter.isEnabled) {
-            publishError("请先打开系统蓝牙")
+            failScan("请先打开系统蓝牙")
             return
         }
 
+        if (lastConnection.phase in listOf(ConnectionPhase.READY, ConnectionPhase.CONNECTING, ConnectionPhase.RECONNECTING)) return
+        stopScan()
         foundDevices.clear()
         _events.tryEmit(TransportEvent.Devices(emptyList()))
         emitConnection(BleConnection(phase = ConnectionPhase.SCANNING))
 
         val scanner = adapter.bluetoothLeScanner
         if (scanner == null) {
-            publishError("蓝牙扫描器不可用")
+            failScan("蓝牙扫描器不可用")
             return
         }
         val settings = ScanSettings.Builder()
-            // LOW_LATENCY 会让 BLE 栈持续以最高占空比扫描；附近广播一多，
-            // UI 线程就会被抢 CPU，表现为未连接也卡顿。配网扫描用 BALANCED
-            // 足够，10 秒超时内仍能发现 ESP32。
-            .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
-            // 固件用 BLE 5 扩展广播（UUID+名称超过 31 字节）。Android 默认
-            // legacy=true，只回传传统广播，因此这里必须显式接收扩展广播。
-            .setLegacy(false)
-            .setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
+            // The hardware UUID filter bounds callback load; use the short
+            // foreground scan window for fast discovery, then stop at 10 s.
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            // Firmware puts its UUID in legacy ADV and name in scan response.
+            // This also works on BLE 4.x Android controllers.
+            .setLegacy(true)
             .build()
-        Log.d(TAG, "startScan legacy=false phy=ALL")
+        Log.d(TAG, "startScan legacy=true")
         scanDevicesDirty = false
         scanPublishJob?.cancel()
         scanPublishJob = scope.launch {
@@ -174,11 +175,15 @@ class AndroidBleMidiTransport(
             }
         }
         try {
-            scanner.startScan(null, settings, scanCallback)
+            val filter = ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build()
+            scanner.startScan(listOf(filter), settings, scanCallback)
         } catch (error: SecurityException) {
             scanPublishJob?.cancel()
             scanPublishJob = null
-            publishError("蓝牙扫描权限被拒绝")
+            failScan("蓝牙扫描权限被拒绝")
+            return
+        } catch (error: RuntimeException) {
+            failScan("无法开始扫描，请检查系统蓝牙后重试")
             return
         }
 
@@ -205,11 +210,13 @@ class AndroidBleMidiTransport(
     @SuppressLint("MissingPermission")
     override fun connect(address: String) {
         stopScan()
+        reconnectJob?.cancel()
+        reconnectJob = null
         desiredAddress = address
         manualDisconnect = false
         retryAttempt = 0
         emitConnection(BleConnection(phase = ConnectionPhase.CONNECTING, deviceAddress = address))
-        connectInternal(address, autoConnect = false)
+        connectInternal(address, reconnecting = false)
     }
 
     @SuppressLint("MissingPermission")
@@ -224,7 +231,7 @@ class AndroidBleMidiTransport(
     }
 
     @SuppressLint("MissingPermission")
-    private fun connectInternal(address: String, autoConnect: Boolean) {
+    private fun connectInternal(address: String, reconnecting: Boolean) {
         val adapter = adapter ?: run {
             publishError("这台设备没有蓝牙适配器")
             return
@@ -234,6 +241,10 @@ class AndroidBleMidiTransport(
             return
         }
         closeGatt()
+        if (!adapter.isEnabled) {
+            scheduleReconnect()
+            return
+        }
         midiCharacteristic = null
         val device = try {
             adapter.getRemoteDevice(address)
@@ -243,23 +254,22 @@ class AndroidBleMidiTransport(
         }
         emitConnection(
             BleConnection(
-                phase = if (autoConnect) ConnectionPhase.RECONNECTING else ConnectionPhase.CONNECTING,
+                phase = if (reconnecting) ConnectionPhase.RECONNECTING else ConnectionPhase.CONNECTING,
                 deviceAddress = address,
                 deviceName = safeDeviceName(device),
             )
         )
-        startConnectWatchdog(address, autoConnect)
-        gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            device.connectGatt(context, autoConnect, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } else {
-            device.connectGatt(context, autoConnect, gattCallback)
-        }
+        startConnectWatchdog(address)
+        gatt = runCatching {
+            device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE,
+                BluetoothDevice.PHY_LE_1M_MASK, Handler(Looper.getMainLooper()))
+        }.getOrNull()
+        if (gatt == null) scheduleReconnect()
     }
 
-    private fun startConnectWatchdog(address: String, autoConnect: Boolean) {
+    private fun startConnectWatchdog(address: String) {
         connectTimeoutJob?.cancel()
-        // autoConnect 走的是系统后台扫描，正常也可能超过 10 s；用更长的窗口，避免把正在成功的重连掐掉。
-        val timeoutMs = if (autoConnect) RECONNECT_TIMEOUT_MS else CONNECT_TIMEOUT_MS
+        val timeoutMs = CONNECT_TIMEOUT_MS
         connectTimeoutJob = scope.launch {
             delay(timeoutMs)
             if (lastConnection.phase != ConnectionPhase.READY && !manualDisconnect) {
@@ -292,10 +302,7 @@ class AndroidBleMidiTransport(
 
         override fun onScanFailed(errorCode: Int) {
             Log.w(TAG, "scan failed code=$errorCode")
-            scanPublishJob?.cancel()
-            scanPublishJob = null
-            publishError("BLE 扫描失败，code=$errorCode")
-            emitConnection(BleConnection(phase = ConnectionPhase.IDLE))
+            failScan("BLE 扫描失败，code=$errorCode")
         }
     }
 
@@ -304,7 +311,7 @@ class AndroidBleMidiTransport(
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             Log.d(TAG, "conn state status=$status newState=$newState address=${gatt.device.address}")
             if (gatt !== this@AndroidBleMidiTransport.gatt) {
-                gatt.close()
+                runCatching { gatt.close() }
                 return
             }
             if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
@@ -315,13 +322,14 @@ class AndroidBleMidiTransport(
                         deviceAddress = gatt.device.address,
                     )
                 )
-                // 物理连接已建立：把看门狗重置为"服务发现"窗口，
-                // 否则 autoConnect 慢到接近超时时，会在 MTU/发现服务过程中被自己掐断。
-                startConnectWatchdog(gatt.device.address, autoConnect = false)
-                runCatching { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) }
-                if (!gatt.requestMtu(MTU_REQUEST)) {
-                    gatt.discoverServices()
-                }
+                // The physical link has its own deadline; restart the bounded
+                // service-discovery / subscription window after it connects.
+                startConnectWatchdog(gatt.device.address)
+                // MTU 23 is sufficient for our packetizer. Service discovery
+                // must not depend on an optional MTU callback (Android 14+
+                // ignores repeated requests on an already-negotiated link).
+                if (!runCatching { gatt.discoverServices() }.getOrDefault(false))
+                    recoverWriteFailure("无法发现 BLE 服务")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 closeGatt()
                 if (manualDisconnect || desiredAddress == null) {
@@ -335,9 +343,9 @@ class AndroidBleMidiTransport(
         @SuppressLint("MissingPermission")
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             if (gatt !== this@AndroidBleMidiTransport.gatt) return
-            if (!gatt.discoverServices()) {
-                publishError("无法发现 BLE 服务")
-            }
+            negotiatedMtu = if (status == BluetoothGatt.GATT_SUCCESS) mtu.coerceAtLeast(23) else 23
+            Log.d(TAG, "MTU updated mtu=$negotiatedMtu status=$status")
+            // An unsolicited/later MTU update must not rediscover services.
         }
 
         @SuppressLint("MissingPermission")
@@ -414,12 +422,22 @@ class AndroidBleMidiTransport(
             )
         }
 
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int,
+        ) {
+            if (gatt === this@AndroidBleMidiTransport.gatt && characteristic.uuid == CHARACTERISTIC_UUID) {
+                writeCompletion?.complete(status)
+            }
+        }
+
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray,
         ) {
-            handleNotification(characteristic, value)
+            if (gatt === this@AndroidBleMidiTransport.gatt) handleNotification(characteristic, value)
         }
 
         @Suppress("DEPRECATION")
@@ -428,22 +446,16 @@ class AndroidBleMidiTransport(
             characteristic: BluetoothGattCharacteristic,
         ) {
             val value = characteristic.value ?: return
-            handleNotification(characteristic, value)
+            if (gatt === this@AndroidBleMidiTransport.gatt) handleNotification(characteristic, value)
         }
     }
 
     @SuppressLint("MissingPermission")
     private fun requestHighPriority(gatt: BluetoothGatt) {
         runCatching { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            runCatching {
-                gatt.setPreferredPhy(
-                    BluetoothDevice.PHY_LE_2M_MASK,
-                    BluetoothDevice.PHY_LE_2M_MASK,
-                    BluetoothDevice.PHY_OPTION_NO_PREFERRED,
-                )
-            }
-        }
+        // Keep the default PHY unless the Android stack itself negotiates it.
+        // Forcing 2M during setup adds another competing control procedure.
+
     }
 
     private fun handleNotification(
@@ -454,16 +466,17 @@ class AndroidBleMidiTransport(
         val messages = runCatching { codec.decode(value) }.getOrElse {
             return
         }
+        if (messages.any { it.isPortHandshake }) clearSendQueue()
         if (messages.isNotEmpty()) {
             _incoming.tryEmit(messages)
         }
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun writePacket(packet: ByteArray, priority: Boolean) {
+    private suspend fun writePacket(packet: ByteArray, priority: Boolean, generation: Long) {
         val gatt = gatt ?: return
         val characteristic = midiCharacteristic ?: return
-        if (lastConnection.phase != ConnectionPhase.READY) return
+        if (lastConnection.phase != ConnectionPhase.READY || generation != sessionGeneration) return
 
         // Note / 端口握手比 CC 重要得多：丢一帧 CC 只是参数跳一下，丢一条 Note Off 就是永久卡音。
         val retries = if (priority) PRIORITY_WRITE_RETRIES else WRITE_RETRIES
@@ -473,17 +486,27 @@ class AndroidBleMidiTransport(
             while (attempt < retries) {
                 // 断开/切换中不要对着已关闭的 gatt 空转，也不要弹假的"写入失败"。
                 if (this@AndroidBleMidiTransport.gatt !== gatt ||
-                    lastConnection.phase != ConnectionPhase.READY
+                    lastConnection.phase != ConnectionPhase.READY || generation != sessionGeneration
                 ) {
                     return
                 }
+                val completion = CompletableDeferred<Int>()
+                writeCompletion = completion
                 val accepted = writeCharacteristic(gatt, characteristic, packet)
-                if (accepted) return
+                if (accepted) {
+                    val status = withTimeoutOrNull(WRITE_TIMEOUT_MS) { completion.await() }
+                    if (writeCompletion === completion) writeCompletion = null
+                    if (status != BluetoothGatt.GATT_SUCCESS && this@AndroidBleMidiTransport.gatt === gatt) {
+                        recoverWriteFailure("BLE 写入未完成，正在重连")
+                    }
+                    return
+                }
+                if (writeCompletion === completion) writeCompletion = null
                 delay(WRITE_RETRY_DELAY_MS)
                 attempt++
             }
             if (lastConnection.phase == ConnectionPhase.READY) {
-                publishError("BLE 写入失败")
+                recoverWriteFailure("BLE 写入失败，正在重连")
             }
         }
     }
@@ -533,7 +556,7 @@ class AndroidBleMidiTransport(
         reconnectJob = scope.launch {
             delay(RECONNECT_DELAYS_MS[attempt])
             if (!manualDisconnect && desiredAddress == address) {
-                connectInternal(address, autoConnect = true)
+                connectInternal(address, reconnecting = true)
             }
         }
     }
@@ -542,10 +565,13 @@ class AndroidBleMidiTransport(
     private fun closeGatt() {
         connectTimeoutJob?.cancel()
         connectTimeoutJob = null
+        writeCompletion?.complete(BluetoothGatt.GATT_FAILURE)
+        writeCompletion = null
         clearSendQueue()
         val current = gatt
         gatt = null
         midiCharacteristic = null
+        negotiatedMtu = 23
         if (current != null) {
             runCatching { current.disconnect() }
             runCatching { current.close() }
@@ -553,12 +579,27 @@ class AndroidBleMidiTransport(
     }
 
     private fun clearSendQueue() {
-        while (prioritySendQueue.tryReceive().isSuccess) {
-            // 清空断线前排队的旧状态。
+        synchronized(queueLock) {
+            sessionGeneration++
+            sendQueue.clear()
         }
-        while (continuousSendQueue.tryReceive().isSuccess) {
-            // 清空断线前排队的旧状态。
+    }
+
+    private fun recoverWriteFailure(message: String) {
+        val failedGatt = gatt
+        val failedGeneration = sessionGeneration
+        scope.launch {
+            if (manualDisconnect || gatt !== failedGatt || sessionGeneration != failedGeneration) return@launch
+            publishError(message)
+            closeGatt()
+            scheduleReconnect()
         }
+    }
+
+    private fun failScan(message: String) {
+        stopScan()
+        emitConnection(BleConnection(phase = ConnectionPhase.ERROR, detail = message))
+        publishError(message)
     }
 
     private fun publishDevices() {
@@ -601,11 +642,10 @@ class AndroidBleMidiTransport(
         val CHARACTERISTIC_UUID: UUID = UUID.fromString("7772E5DB-3868-4112-A1A9-F2669D106BF3")
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805F9B34FB")
 
-        private const val MTU_REQUEST = 247
         private const val SCAN_TIMEOUT_MS = 10_000L
         private const val CONNECT_TIMEOUT_MS = 10_000L
-        private const val RECONNECT_TIMEOUT_MS = 30_000L
         private const val DEVICE_PUBLISH_INTERVAL_MS = 250L
+        private const val WRITE_TIMEOUT_MS = 1_500L
         private const val WRITE_PACING_MS = 3L
         private const val WRITE_RETRY_DELAY_MS = 4L
         private const val WRITE_RETRIES = 5

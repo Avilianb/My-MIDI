@@ -9,6 +9,7 @@
 #include "midi_bridge.h"
 
 #include <string.h>
+#include <stdatomic.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -24,9 +25,11 @@ static const char *TAG = "midi_bridge";
 #define BLE_TO_USB_DEPTH 256
 #define USB_TO_BLE_DEPTH 256
 #define MIDI_MSG_MAX_LEN 3
+#define PLAYER_CHANNELS 8
 #define MIDI_BATCH_MAX 8
 #define USB_READ_BATCH 16
-#define USB_WRITE_RETRY_US 5000
+#define USB_DRAIN_BATCH 32
+#define PANIC_BATCH 8
 #define LAT_BUCKET_US 100
 #define LAT_BUCKET_COUNT 64
 
@@ -35,31 +38,40 @@ typedef struct {
     uint8_t len;
     uint8_t data[MIDI_MSG_MAX_LEN];
     int64_t rx_time_us;
+    uint32_t generation;
+    uint32_t recovery_epoch;
 } midi_msg_t;
 
 static QueueHandle_t s_ble_to_usb;
 static QueueHandle_t s_usb_to_ble[USB_MIDI_CABLE_COUNT];
 static TaskHandle_t s_ble_task_handle;
 
-static volatile uint32_t s_ble_rx_dropped;
-static volatile uint32_t s_ble_to_usb_sent;
-static volatile uint32_t s_ble_to_usb_dropped;
-static volatile uint32_t s_usb_unsupported;
-static volatile uint32_t s_usb_to_ble_sent;
-static volatile uint32_t s_usb_to_ble_dropped;
-static volatile uint32_t s_panic_failures;
-static volatile uint32_t s_queue_flushes;
+static _Atomic uint32_t s_ble_rx_dropped;
+static _Atomic uint32_t s_ble_to_usb_sent;
+static _Atomic uint32_t s_ble_to_usb_dropped;
+static _Atomic uint32_t s_usb_unsupported;
+static _Atomic uint32_t s_usb_to_ble_sent;
+static _Atomic uint32_t s_usb_to_ble_dropped;
+static _Atomic uint32_t s_panic_failures;
+static _Atomic uint32_t s_queue_flushes;
 
 /*
  * F-01 / F-07 防卡音状态表：
  * - s_active_notes 记录每个 (cable, channel) 当前已发往 USB 且未释放的音符（128 bit = 2 × uint64_t）
  * - s_pending_note_off 记录任何因队列满或 USB FIFO 满而未能立即发出的 Note Off，在后续循环最优先补发
  */
-static uint64_t s_active_notes[USB_MIDI_CABLE_COUNT][16][2];
-static uint64_t s_pending_note_off[USB_MIDI_CABLE_COUNT][16][2];
+static uint64_t s_active_notes[USB_MIDI_CABLE_COUNT][PLAYER_CHANNELS][2];
+static uint64_t s_pending_note_off[USB_MIDI_CABLE_COUNT][PLAYER_CHANNELS][2];
 /* 每个 cable 是否有挂起 Note Off；为空时 flush 直接返回，避免每 1 ms 空转 32 次临界区。 */
 static volatile bool s_pending_note_off_any[USB_MIDI_CABLE_COUNT];
 static portMUX_TYPE s_note_lock = portMUX_INITIALIZER_UNLOCKED;
+/* A lost release invalidates this cable's backlog, then retries a full panic.
+ * Do not cancel an earlier dropped release when a newer Note On is enqueued. */
+static uint32_t s_recovery_epoch[USB_MIDI_CABLE_COUNT];
+static bool s_recovery_requested[USB_MIDI_CABLE_COUNT];
+/* usb_task owns these masks. Each bit is a CC still awaiting FIFO space. */
+static uint8_t s_panic_cc[USB_MIDI_CABLE_COUNT][PLAYER_CHANNELS];
+static portMUX_TYPE s_shadow_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /*
  * USB 侧影子状态：DAW 通常只在参数变化时回传 CC / Pitch Bend，而它初始化时的
@@ -68,13 +80,16 @@ static portMUX_TYPE s_note_lock = portMUX_INITIALIZER_UNLOCKED;
  * 音符不回放：连接前就一直按住的音重放会造成意外触发。
  */
 #define SHADOW_CCS 128
-#define SHADOW_CHANNELS 16
+#define SHADOW_CHANNELS PLAYER_CHANNELS
 static uint8_t s_shadow_cc[USB_MIDI_CABLE_COUNT][SHADOW_CHANNELS][SHADOW_CCS];
 static uint8_t s_shadow_cc_valid[USB_MIDI_CABLE_COUNT][SHADOW_CHANNELS][SHADOW_CCS / 8];
 static uint16_t s_shadow_pb[USB_MIDI_CABLE_COUNT][SHADOW_CHANNELS];
 static uint16_t s_shadow_pb_valid[USB_MIDI_CABLE_COUNT];
 /* usb_task 只置位，由 ble_task（唯一的 BLE 通知发送者）执行回放。 */
-static volatile bool s_shadow_replay_pending[USB_MIDI_CABLE_COUNT];
+static _Atomic uint32_t s_shadow_replay_request[USB_MIDI_CABLE_COUNT];
+/* Only ble_task writes these; a newer request cannot be lost at completion. */
+static uint32_t s_shadow_replay_completed[USB_MIDI_CABLE_COUNT];
+static uint32_t s_shadow_replay_in_progress[USB_MIDI_CABLE_COUNT];
 
 /* 每个 cable 的绑定代次快照；代次变化说明该端口的归属手机变了。只在 usb_task 中读写。 */
 static uint32_t s_cable_generation_seen[USB_MIDI_CABLE_COUNT];
@@ -94,58 +109,29 @@ static inline bool is_note_off_msg(const uint8_t *data, uint8_t len)
     return len == 3 && ((data[0] & 0xF0) == 0x80 || ((data[0] & 0xF0) == 0x90 && data[2] == 0));
 }
 
-static void mark_pending_note_off(uint8_t cable_num, uint8_t ch, uint8_t note)
+static void request_recovery(uint8_t cable)
 {
-    if (cable_num >= USB_MIDI_CABLE_COUNT || ch >= 16 || note >= 128) {
-        return;
-    }
     portENTER_CRITICAL(&s_note_lock);
-    s_pending_note_off[cable_num][ch][note >> 6] |= (1ULL << (note & 63));
-    s_pending_note_off_any[cable_num] = true;
+    if (!s_recovery_requested[cable]) {
+        s_recovery_requested[cable] = true;
+        s_recovery_epoch[cable]++;
+    }
     portEXIT_CRITICAL(&s_note_lock);
 }
 
-/** 丢弃某个 cable 的全部音符状态（端口换绑时使用：旧端口的音符必须由 panic 释放，不能错发到新手机）。 */
-static void clear_cable_note_state(uint8_t cable_num)
+/* Atomic USB event write, without blocking either performer's bridge loop. */
+static bool usb_write_all(uint8_t cable, const uint8_t *data, uint8_t len)
 {
-    if (cable_num >= USB_MIDI_CABLE_COUNT) {
-        return;
+    uint8_t wire[MIDI_MSG_MAX_LEN];
+    memcpy(wire, data, len);
+    if (data[0] >= 0x80 && data[0] < 0xF0) {
+        uint8_t local_channel = data[0] & 15;
+        if (local_channel >= PLAYER_CHANNELS) return false;
+        wire[0] = (data[0] & 0xF0) | (cable * PLAYER_CHANNELS + local_channel);
     }
-    portENTER_CRITICAL(&s_note_lock);
-    memset(s_active_notes[cable_num], 0, sizeof(s_active_notes[cable_num]));
-    memset(s_pending_note_off[cable_num], 0, sizeof(s_pending_note_off[cable_num]));
-    s_pending_note_off_any[cable_num] = false;
-    portEXIT_CRITICAL(&s_note_lock);
+    return usb_midi_write(cable, wire, len) == len;
 }
 
-static void clear_pending_note_off(uint8_t cable_num, uint8_t ch, uint8_t note)
-{
-    if (cable_num >= USB_MIDI_CABLE_COUNT || ch >= 16 || note >= 128) {
-        return;
-    }
-    portENTER_CRITICAL(&s_note_lock);
-    s_pending_note_off[cable_num][ch][note >> 6] &= ~(1ULL << (note & 63));
-    portEXIT_CRITICAL(&s_note_lock);
-}
-/** 把一条消息完整写入指定 USB 虚拟端口；FIFO 满时最多重试 5 ms。 */
-static bool usb_write_all(uint8_t cable_num, const uint8_t *data, uint8_t len)
-{
-    uint32_t sent = 0;
-    const int64_t deadline = esp_timer_get_time() + USB_WRITE_RETRY_US;
-
-    while (sent < len) {
-        const uint32_t written = usb_midi_write(cable_num, data + sent, len - sent);
-        sent += written;
-        if (sent >= len) {
-            return true;
-        }
-        if (esp_timer_get_time() >= deadline) {
-            return false;
-        }
-        vTaskDelay(1);
-    }
-    return true;
-}
 /** 记录 BLE 回调入队到 USB 写完的延迟。 */
 static void latency_record(int64_t rx_time_us)
 {
@@ -185,84 +171,45 @@ static uint32_t latency_percentile(uint32_t percent)
     return 6300;
 }
 
-/** 尝试补发所有挂起的 Note Off；返回是否全部排空。 */
-static void flush_pending_note_offs(uint8_t cable_num)
+/** Retry at most PANIC_BATCH packets per cable per turn, retaining failures. */
+static void flush_pending_note_offs(uint8_t cable)
 {
-    if (cable_num >= USB_MIDI_CABLE_COUNT) {
-        return;
-    }
-    if (!s_pending_note_off_any[cable_num] || !usb_midi_device_mounted()) {
-        return;
-    }
-
-    /* 先落旗标再扫描：期间新置位的挂起位会在下一轮重新触发，不会漏掉。 */
-    s_pending_note_off_any[cable_num] = false;
-
-    for (uint8_t ch = 0; ch < 16; ch++) {
+    if (!s_pending_note_off_any[cable] || !usb_midi_device_mounted()) return;
+    unsigned budget = PANIC_BATCH;
+    const uint8_t controllers[] = {64, 120, 123};
+    for (uint8_t ch = 0; ch < PLAYER_CHANNELS; ch++) {
+        for (uint8_t i = 0; i < 3; i++) {
+            if (!(s_panic_cc[cable][ch] & (1U << i))) continue;
+            uint8_t msg[] = {(uint8_t)(0xB0 | ch), controllers[i], 0};
+            if (!usb_write_all(cable, msg, 3)) { s_panic_failures++; return; }
+            s_panic_cc[cable][ch] &= ~(1U << i);
+            if (--budget == 0) return;
+        }
         for (uint8_t word = 0; word < 2; word++) {
-            portENTER_CRITICAL(&s_note_lock);
-            uint64_t mask = s_pending_note_off[cable_num][ch][word];
-            portEXIT_CRITICAL(&s_note_lock);
-            while (mask != 0) {
-                const uint8_t bit = (uint8_t)__builtin_ctzll(mask);
-                const uint8_t note = (uint8_t)((word << 6) | bit);
-                const uint8_t msg[3] = { (uint8_t)(0x80 | ch), note, 0 };
-                if (!usb_write_all(cable_num, msg, sizeof(msg))) {
-                    s_pending_note_off_any[cable_num] = true;
-                    return;
-                }
-                s_active_notes[cable_num][ch][word] &= ~(1ULL << bit);
-                portENTER_CRITICAL(&s_note_lock);
-                s_pending_note_off[cable_num][ch][word] &= ~(1ULL << bit);
-                portEXIT_CRITICAL(&s_note_lock);
-                s_ble_to_usb_sent++;
-                mask &= (mask - 1);
+            uint64_t mask = s_pending_note_off[cable][ch][word];
+            while (mask) {
+                uint8_t bit = (uint8_t)__builtin_ctzll(mask);
+                uint8_t msg[] = {(uint8_t)(0x80 | ch), (uint8_t)(word * 64 + bit), 0};
+                if (!usb_write_all(cable, msg, 3)) { s_panic_failures++; return; }
+                s_pending_note_off[cable][ch][word] &= ~(1ULL << bit);
+                mask &= mask - 1;
+                if (--budget == 0) return;
             }
         }
     }
+    s_pending_note_off_any[cable] = false;
 }
 
-/** 向指定 USB 虚拟端口发送逐音 Note Off + 16 通道 All Notes Off / All Sound Off / Sustain Off。 */
-static void usb_send_panic_cable(uint8_t cable_num)
+static void usb_send_panic_cable(uint8_t cable)
 {
-    if (cable_num >= USB_MIDI_CABLE_COUNT) {
-        return;
-    }
-
-    /* 先将所有活跃音符转为 pending_note_off，确保即使当前 FIFO 拥塞也会在后续补发 */
-    portENTER_CRITICAL(&s_note_lock);
-    for (uint8_t ch = 0; ch < 16; ch++) {
-        s_pending_note_off[cable_num][ch][0] |= s_active_notes[cable_num][ch][0];
-        s_pending_note_off[cable_num][ch][1] |= s_active_notes[cable_num][ch][1];
-        s_active_notes[cable_num][ch][0] = 0;
-        s_active_notes[cable_num][ch][1] = 0;
-        if (s_pending_note_off[cable_num][ch][0] | s_pending_note_off[cable_num][ch][1]) {
-            s_pending_note_off_any[cable_num] = true;
+    for (uint8_t ch = 0; ch < PLAYER_CHANNELS; ch++) {
+        for (uint8_t w = 0; w < 2; w++) {
+            s_pending_note_off[cable][ch][w] |= s_active_notes[cable][ch][w];
+            s_active_notes[cable][ch][w] = 0;
         }
+        s_panic_cc[cable][ch] = 7;
     }
-    portEXIT_CRITICAL(&s_note_lock);
-
-    if (!usb_midi_device_mounted()) {
-        return;
-    }
-
-    flush_pending_note_offs(cable_num);
-
-    for (uint8_t ch = 0; ch < 16; ch++) {
-        const uint8_t messages[3][3] = {
-            { (uint8_t)(0xB0 | ch), 123, 0 }, /* All Notes Off */
-            { (uint8_t)(0xB0 | ch), 120, 0 }, /* All Sound Off */
-            { (uint8_t)(0xB0 | ch), 64, 0 },  /* Sustain Off */
-        };
-        for (size_t i = 0; i < 3; i++) {
-            if (!usb_midi_device_mounted()) {
-                return;
-            }
-            if (!usb_write_all(cable_num, messages[i], sizeof(messages[i]))) {
-                s_panic_failures++;
-            }
-        }
-    }
+    s_pending_note_off_any[cable] = true;
 }
 
 static void usb_send_panic_all(void)
@@ -282,6 +229,7 @@ static void clear_queues(void)
     portENTER_CRITICAL(&s_note_lock);
     memset(s_active_notes, 0, sizeof(s_active_notes));
     memset(s_pending_note_off, 0, sizeof(s_pending_note_off));
+    memset(s_panic_cc, 0, sizeof(s_panic_cc));
     for (uint8_t c = 0; c < USB_MIDI_CABLE_COUNT; c++) {
         s_pending_note_off_any[c] = false;
     }
@@ -319,9 +267,17 @@ static bool usb_packet_to_message(const uint8_t pkt[4], midi_msg_t *out)
         return false;
     }
 
+    out->generation = ble_midi_link_cable_generation(cable_num);
     out->cable_num = cable_num;
     out->len = len;
     memcpy(out->data, &pkt[1], len);
+    if (out->data[0] >= 0x80 && out->data[0] < 0xF0) {
+        uint8_t channel = out->data[0] & 15;
+        /* Live can echo the same Remote message on both output ports.
+         * Keep only this performer's namespace, then restore local channels. */
+        if (channel / PLAYER_CHANNELS != cable_num) return false;
+        out->data[0] = (out->data[0] & 0xF0) | (channel % PLAYER_CHANNELS);
+    }
     out->rx_time_us = esp_timer_get_time();
     return true;
 }
@@ -334,6 +290,7 @@ static void shadow_record(const midi_msg_t *msg)
     const uint8_t cable = msg->cable_num;
     const uint8_t status = msg->data[0];
     const uint8_t ch = status & 0x0F;
+    portENTER_CRITICAL(&s_shadow_lock);
     if ((status & 0xF0) == 0xB0) {
         const uint8_t cc = msg->data[1] & 0x7F;
         s_shadow_cc[cable][ch][cc] = msg->data[2] & 0x7F;
@@ -343,70 +300,88 @@ static void shadow_record(const midi_msg_t *msg)
             (uint16_t)((msg->data[1] & 0x7F) | ((msg->data[2] & 0x7F) << 7));
         s_shadow_pb_valid[cable] |= (uint16_t)(1U << ch);
     }
+    portEXIT_CRITICAL(&s_shadow_lock);
 }
 
 /** 只清有效性：USB 卸载意味着 DAW 可能重启，重枚举后它会重新 dump。 */
 static void shadow_clear(void)
 {
+    portENTER_CRITICAL(&s_shadow_lock);
     memset(s_shadow_cc_valid, 0, sizeof(s_shadow_cc_valid));
     memset(s_shadow_pb_valid, 0, sizeof(s_shadow_pb_valid));
+    portEXIT_CRITICAL(&s_shadow_lock);
 }
 
-/** 按 (channel, CC) 升序回放某个 cable 的影子状态；14-bit 的 MSB/LSB 天然成对且顺序正确。 */
+/* One small replay batch per turn keeps the other phone's live feedback moving. */
+static uint16_t s_replay_cursor[USB_MIDI_CABLE_COUNT];
+static uint32_t s_replay_generation[USB_MIDI_CABLE_COUNT];
 static void shadow_replay(uint8_t cable)
 {
-    if (cable >= USB_MIDI_CABLE_COUNT || !usb_midi_device_mounted()) {
+    uint32_t generation = ble_midi_link_cable_generation(cable);
+    uint32_t request = s_shadow_replay_request[cable];
+    if (s_replay_generation[cable] != generation || s_shadow_replay_in_progress[cable] != request) {
+        s_shadow_replay_in_progress[cable] = request;
+        s_replay_generation[cable] = generation;
+        s_replay_cursor[cable] = 0;
+    }
+    uint8_t bufs[MIDI_BATCH_MAX][3], lens[MIDI_BATCH_MAX];
+    const uint8_t *msgs[MIDI_BATCH_MAX];
+    uint8_t n = 0;
+    uint16_t cursor = s_replay_cursor[cable];
+    while (cursor < PLAYER_CHANNELS * 129 && n < MIDI_BATCH_MAX) {
+        uint8_t ch = cursor / 129, cc = cursor % 129;
+        cursor++;
+        portENTER_CRITICAL(&s_shadow_lock);
+        bool valid = cc < 128 ? (s_shadow_cc_valid[cable][ch][cc >> 3] & (1U << (cc & 7))) != 0
+                               : (s_shadow_pb_valid[cable] & (1U << ch)) != 0;
+        uint16_t value = cc < 128 ? s_shadow_cc[cable][ch][cc] : s_shadow_pb[cable][ch];
+        portEXIT_CRITICAL(&s_shadow_lock);
+        if (!valid) continue;
+        bufs[n][0] = (cc < 128 ? 0xB0 : 0xE0) | ch;
+        bufs[n][1] = cc < 128 ? cc : value & 127;
+        bufs[n][2] = cc < 128 ? value : value >> 7;
+        msgs[n] = bufs[n]; lens[n++] = 3;
+    }
+    if (n && ble_midi_link_send(cable, msgs, lens, n) != ESP_OK) return;
+    s_replay_cursor[cable] = cursor;
+    if (cursor == PLAYER_CHANNELS * 129) {
+        s_shadow_replay_completed[cable] = request;
+        s_replay_cursor[cable] = 0;
+    }
+}
+
+static void process_ble_message(const midi_msg_t *msg)
+{
+    uint8_t c = msg->cable_num;
+    if (msg->data[0] >= 0x80 && msg->data[0] < 0xF0 &&
+        (msg->data[0] & 15) >= PLAYER_CHANNELS) {
+        s_ble_to_usb_dropped++;
         return;
     }
-    uint8_t bufs[MIDI_BATCH_MAX][3];
-    const uint8_t *msgs[MIDI_BATCH_MAX];
-    uint8_t lens[MIDI_BATCH_MAX];
-    uint8_t n = 0;
-    uint32_t replayed = 0;
-
-    for (uint8_t ch = 0; ch < SHADOW_CHANNELS; ch++) {
-        for (uint8_t cc = 0; cc < SHADOW_CCS; cc++) {
-            if ((s_shadow_cc_valid[cable][ch][cc >> 3] & (uint8_t)(1U << (cc & 7))) == 0) {
-                continue;
-            }
-            bufs[n][0] = (uint8_t)(0xB0 | ch);
-            bufs[n][1] = cc;
-            bufs[n][2] = s_shadow_cc[cable][ch][cc];
-            msgs[n] = bufs[n];
-            lens[n] = 3;
-            n++;
-            if (n == MIDI_BATCH_MAX) {
-                if (ble_midi_link_send(cable, msgs, lens, n) == ESP_OK) {
-                    replayed += n;
-                }
-                n = 0;
-                if (!usb_midi_device_mounted()) {
-                    return;
-                }
-                vTaskDelay(pdMS_TO_TICKS(1));
-            }
-        }
-        if ((s_shadow_pb_valid[cable] & (uint16_t)(1U << ch)) != 0) {
-            const uint16_t value = s_shadow_pb[cable][ch];
-            bufs[n][0] = (uint8_t)(0xE0 | ch);
-            bufs[n][1] = (uint8_t)(value & 0x7F);
-            bufs[n][2] = (uint8_t)((value >> 7) & 0x7F);
-            msgs[n] = bufs[n];
-            lens[n] = 3;
-            n++;
-            if (n == MIDI_BATCH_MAX) {
-                if (ble_midi_link_send(cable, msgs, lens, n) == ESP_OK) {
-                    replayed += n;
-                }
-                n = 0;
-                vTaskDelay(pdMS_TO_TICKS(1));
-            }
-        }
+    portENTER_CRITICAL(&s_note_lock);
+    bool stale = msg->recovery_epoch != s_recovery_epoch[c] || s_recovery_requested[c];
+    portEXIT_CRITICAL(&s_note_lock);
+    if (stale || msg->generation != ble_midi_link_cable_generation(c) ||
+        msg->generation != s_cable_generation_seen[c] ||
+        s_pending_note_off_any[c] || !usb_midi_device_mounted() ||
+        !ble_midi_link_port_ready(c)) {
+        s_ble_to_usb_dropped++;
+        return;
     }
-    if (n > 0 && ble_midi_link_send(cable, msgs, lens, n) == ESP_OK) {
-        replayed += n;
+    if (usb_write_all(c, msg->data, msg->len)) {
+        uint8_t ch = msg->data[0] & 15;
+        uint8_t note = msg->data[1] & 127;
+        if (is_note_on_msg(msg->data, msg->len))
+            s_active_notes[c][ch][note >> 6] |= 1ULL << (note & 63);
+        else if (is_note_off_msg(msg->data, msg->len))
+            s_active_notes[c][ch][note >> 6] &= ~(1ULL << (note & 63));
+        s_ble_to_usb_sent++;
+        latency_record(msg->rx_time_us);
+    } else {
+        s_ble_to_usb_dropped++;
+        /* Sustain/button CC releases are safety-critical too. */
+        request_recovery(c);
     }
-    ESP_LOGI(TAG, "shadow replay cable %u: %lu msgs", cable, (unsigned long)replayed);
 }
 
 static void usb_task(void *arg)
@@ -427,9 +402,9 @@ static void usb_task(void *arg)
                 ESP_LOGW(TAG, "cable %u rebound; releasing notes on that port", c);
                 /* 先把活跃音符转成逐音 Note Off 发出去，再清状态；顺序反了逐音 Off 会全部丢失。 */
                 usb_send_panic_cable(c);
-                clear_cable_note_state(c);
+                /* Keep failed panic packets pending until USB accepts them. */
                 /* 新归属的手机需要对齐该端口在 DAW 里的当前值。 */
-                s_shadow_replay_pending[c] = true;
+                s_shadow_replay_request[c]++;
                 if (s_ble_task_handle != NULL) {
                     xTaskNotifyGive(s_ble_task_handle);
                 }
@@ -445,7 +420,7 @@ static void usb_task(void *arg)
             }
             if (!was_port_ready[c] && port_ready) {
                 ESP_LOGI(TAG, "BLE port %u ready; scheduling shadow replay", c + 1);
-                s_shadow_replay_pending[c] = true;
+                s_shadow_replay_request[c]++;
                 if (s_ble_task_handle != NULL) {
                     xTaskNotifyGive(s_ble_task_handle);
                 }
@@ -465,64 +440,29 @@ static void usb_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(50));
             if (usb_midi_device_mounted()) {
                 ESP_LOGI(TAG, "USB mounted; panic all cables");
+                clear_queues();
                 usb_send_panic_all();
             }
-            clear_queues();
         }
 
         was_mounted = mounted;
 
         midi_msg_t msg;
 
-        /* BLE → USB：先排空，按 msg.cable_num 写入对应的 USB 虚拟线缆（Port 1 / Port 2）。
-         * 挂起的 Note Off 必须留到本轮排空之后再补发：否则它会抢在仍排在队列里的同音 Note On
-         * 之前发出，DAW 收到 Off→On，音符被永久按住。 */
-        while (xQueueReceive(s_ble_to_usb, &msg, 0) == pdTRUE) {
-            const uint8_t ch = (uint8_t)(msg.data[0] & 0x0F);
-            const uint8_t note = (uint8_t)(msg.data[1] & 0x7F);
-            const bool note_on = is_note_on_msg(msg.data, msg.len);
-            const bool note_off = is_note_off_msg(msg.data, msg.len);
-
-            if (!usb_midi_device_mounted() || !ble_midi_link_port_ready(msg.cable_num)) {
-                if (note_off && msg.cable_num < USB_MIDI_CABLE_COUNT) {
-                    s_active_notes[msg.cable_num][ch][note >> 6] &= ~(1ULL << (note & 63));
-                    mark_pending_note_off(msg.cable_num, ch, note);
-                } else {
-                    s_ble_to_usb_dropped++;
-                }
-                continue;
-            }
-
-            if (usb_write_all(msg.cable_num, msg.data, msg.len)) {
-                if (note_on) {
-                    /*
-                     * 只置活跃位，不能在这里清除挂起的 Note Off：
-                     * 这条 Note On 早于那条被丢弃的 Note Off 入队，若在这里清除，
-                     * 队列满时丢掉的 Note Off 就永远补不回来了（DAW 卡音）。
-                     * 真正的"重按取消旧 Off"发生在 midi_bridge_on_ble_midi 入队成功后。
-                     */
-                    s_active_notes[msg.cable_num][ch][note >> 6] |= (1ULL << (note & 63));
-                } else if (note_off) {
-                    s_active_notes[msg.cable_num][ch][note >> 6] &= ~(1ULL << (note & 63));
-                    clear_pending_note_off(msg.cable_num, ch, note);
-                }
-                s_ble_to_usb_sent++;
-                latency_record(msg.rx_time_us);
-            } else {
-                if (note_off) {
-                    s_active_notes[msg.cable_num][ch][note >> 6] &= ~(1ULL << (note & 63));
-                    mark_pending_note_off(msg.cable_num, ch, note);
-                } else {
-                    s_ble_to_usb_dropped++;
-                }
-            }
+        for (uint8_t c = 0; c < USB_MIDI_CABLE_COUNT; c++) {
+            portENTER_CRITICAL(&s_note_lock);
+            bool recover = s_recovery_requested[c];
+            s_recovery_requested[c] = false;
+            portEXIT_CRITICAL(&s_note_lock);
+            if (recover) usb_send_panic_cable(c);
+            flush_pending_note_offs(c);
         }
 
-        /* 队列已排空：此时补发挂起的 Note Off 不会被同音的 Note On 反超。 */
-        if (mounted) {
-            for (uint8_t c = 0; c < USB_MIDI_CABLE_COUNT; c++) {
-                flush_pending_note_offs(c);
-            }
+        /* Bound work so a continuous BLE flood cannot starve USB OUT or GAP
+         * boundary checks. Never route an old owner's queued event to a new one. */
+        for (unsigned n = 0; n < USB_DRAIN_BATCH &&
+             xQueueReceive(s_ble_to_usb, &msg, 0) == pdTRUE; n++) {
+            process_ble_message(&msg);
         }
 
         /* USB → BLE：一次最多读取 16 个 4 字节事件包，按 cable_num 投入独立队列，互不阻塞。 */
@@ -536,6 +476,7 @@ static void usb_task(void *arg)
                 continue;
             }
             shadow_record(&incoming);
+            if (!ble_midi_link_port_ready(incoming.cable_num)) continue;
             if (xQueueSend(s_usb_to_ble[incoming.cable_num], &incoming, 0) == pdTRUE) {
                 enqueued_any = true;
             } else {
@@ -585,10 +526,9 @@ static void ble_task(void *arg)
 
         /* 影子回放由唯一的 BLE 发送者执行：先对齐快照，后面的实时数据再覆盖它。 */
         for (uint8_t c = 0; c < USB_MIDI_CABLE_COUNT; c++) {
-            if (!s_shadow_replay_pending[c]) {
+            if (s_shadow_replay_request[c] == s_shadow_replay_completed[c]) {
                 continue;
             }
-            s_shadow_replay_pending[c] = false;
             if (ble_midi_link_port_ready(c) && usb_midi_device_mounted()) {
                 shadow_replay(c);
             }
@@ -599,7 +539,8 @@ static void ble_task(void *arg)
             size_t count = 0;
             while (count < MIDI_BATCH_MAX &&
                    xQueueReceive(s_usb_to_ble[target_cable], &batch[count], 0) == pdTRUE) {
-                count++;
+                if (batch[count].generation == ble_midi_link_cable_generation(target_cable)) count++;
+                else s_usb_to_ble_dropped++;
             }
             if (count == 0) {
                 continue;
@@ -679,6 +620,11 @@ void midi_bridge_on_ble_midi(uint8_t cable_num, const uint8_t *msg, uint8_t len,
         return;
     }
 
+    if (msg[0] >= 0x80 && msg[0] < 0xF0 && (msg[0] & 15) >= PLAYER_CHANNELS) {
+        s_ble_rx_dropped++;
+        return;
+    }
+
     midi_msg_t item = {
         .cable_num = cable_num,
         .len = len,
@@ -686,22 +632,14 @@ void midi_bridge_on_ble_midi(uint8_t cable_num, const uint8_t *msg, uint8_t len,
     };
     memcpy(item.data, msg, len);
 
-    /* 只有 3 字节消息才有 (channel, note) 数据字节；0xF8 时钟等 1 字节消息不能读 msg[1]。 */
-    const bool note_on = is_note_on_msg(msg, len);
-    const bool note_off = is_note_off_msg(msg, len);
-    const uint8_t ch = note_on || note_off ? (uint8_t)(msg[0] & 0x0F) : 0;
-    const uint8_t note = note_on || note_off ? (uint8_t)(msg[1] & 0x7F) : 0;
-
-    if (xQueueSend(s_ble_to_usb, &item, pdMS_TO_TICKS(5)) != pdTRUE) {
-        if (note_off) {
-            /* F-01 防卡音：即使队列满，Note Off 也绝不丢弃，写入挂起位图由 usb_task 补发 */
-            mark_pending_note_off(cable_num, ch, note);
-        } else {
-            s_ble_rx_dropped++;
-        }
-    } else if (note_on) {
-        /* 入队成功后才撤销挂起的 Note Off：本机重按该音说明旧状态已被覆盖。
-         * 若在入队前撤销，队列满时这条 Note On 被丢弃会让之前的音永久卡住。 */
-        clear_pending_note_off(cable_num, ch, note);
+    item.generation = ble_midi_link_cable_generation(cable_num);
+    portENTER_CRITICAL(&s_note_lock);
+    item.recovery_epoch = s_recovery_epoch[cable_num];
+    bool recovering = s_recovery_requested[cable_num];
+    portEXIT_CRITICAL(&s_note_lock);
+    /* BLE host callbacks must never wait on the USB consumer. */
+    if (recovering || xQueueSend(s_ble_to_usb, &item, 0) != pdTRUE) {
+        s_ble_rx_dropped++;
+        request_recovery(cable_num);
     }
 }

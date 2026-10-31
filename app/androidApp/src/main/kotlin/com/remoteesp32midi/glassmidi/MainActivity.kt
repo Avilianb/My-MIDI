@@ -56,7 +56,8 @@ class MainActivity : ComponentActivity() {
                 onRequestPermissions = { permissionLauncher.launch(requiredPermissions()) },
                 onConnect = { device: BleDevice ->
                     runCatching { MidiConnectionService.start(this) }
-                    container.store.connect(device)
+                        .onSuccess { container.store.connect(device) }
+                        .onFailure { container.store.reportError("无法启动蓝牙前台服务，请检查附近设备权限后重试") }
                 },
                 onDisconnect = {
                     container.store.disconnect()
