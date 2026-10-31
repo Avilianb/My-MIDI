@@ -25,6 +25,7 @@ static const char *TAG = "midi_bridge";
 #define BLE_TO_USB_DEPTH 256
 #define USB_TO_BLE_DEPTH 256
 #define MIDI_MSG_MAX_LEN 3
+#define PLAYER_CHANNELS 8
 #define MIDI_BATCH_MAX 8
 #define USB_READ_BATCH 16
 #define USB_DRAIN_BATCH 32
@@ -59,8 +60,8 @@ static _Atomic uint32_t s_queue_flushes;
  * - s_active_notes 记录每个 (cable, channel) 当前已发往 USB 且未释放的音符（128 bit = 2 × uint64_t）
  * - s_pending_note_off 记录任何因队列满或 USB FIFO 满而未能立即发出的 Note Off，在后续循环最优先补发
  */
-static uint64_t s_active_notes[USB_MIDI_CABLE_COUNT][16][2];
-static uint64_t s_pending_note_off[USB_MIDI_CABLE_COUNT][16][2];
+static uint64_t s_active_notes[USB_MIDI_CABLE_COUNT][PLAYER_CHANNELS][2];
+static uint64_t s_pending_note_off[USB_MIDI_CABLE_COUNT][PLAYER_CHANNELS][2];
 /* 每个 cable 是否有挂起 Note Off；为空时 flush 直接返回，避免每 1 ms 空转 32 次临界区。 */
 static volatile bool s_pending_note_off_any[USB_MIDI_CABLE_COUNT];
 static portMUX_TYPE s_note_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -69,7 +70,7 @@ static portMUX_TYPE s_note_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_recovery_epoch[USB_MIDI_CABLE_COUNT];
 static bool s_recovery_requested[USB_MIDI_CABLE_COUNT];
 /* usb_task owns these masks. Each bit is a CC still awaiting FIFO space. */
-static uint8_t s_panic_cc[USB_MIDI_CABLE_COUNT][16];
+static uint8_t s_panic_cc[USB_MIDI_CABLE_COUNT][PLAYER_CHANNELS];
 static portMUX_TYPE s_shadow_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /*
@@ -79,7 +80,7 @@ static portMUX_TYPE s_shadow_lock = portMUX_INITIALIZER_UNLOCKED;
  * 音符不回放：连接前就一直按住的音重放会造成意外触发。
  */
 #define SHADOW_CCS 128
-#define SHADOW_CHANNELS 16
+#define SHADOW_CHANNELS PLAYER_CHANNELS
 static uint8_t s_shadow_cc[USB_MIDI_CABLE_COUNT][SHADOW_CHANNELS][SHADOW_CCS];
 static uint8_t s_shadow_cc_valid[USB_MIDI_CABLE_COUNT][SHADOW_CHANNELS][SHADOW_CCS / 8];
 static uint16_t s_shadow_pb[USB_MIDI_CABLE_COUNT][SHADOW_CHANNELS];
@@ -121,7 +122,14 @@ static void request_recovery(uint8_t cable)
 /* Atomic USB event write, without blocking either performer's bridge loop. */
 static bool usb_write_all(uint8_t cable, const uint8_t *data, uint8_t len)
 {
-    return usb_midi_write(cable, data, len) == len;
+    uint8_t wire[MIDI_MSG_MAX_LEN];
+    memcpy(wire, data, len);
+    if (data[0] >= 0x80 && data[0] < 0xF0) {
+        uint8_t local_channel = data[0] & 15;
+        if (local_channel >= PLAYER_CHANNELS) return false;
+        wire[0] = (data[0] & 0xF0) | (cable * PLAYER_CHANNELS + local_channel);
+    }
+    return usb_midi_write(cable, wire, len) == len;
 }
 
 /** 记录 BLE 回调入队到 USB 写完的延迟。 */
@@ -169,7 +177,7 @@ static void flush_pending_note_offs(uint8_t cable)
     if (!s_pending_note_off_any[cable] || !usb_midi_device_mounted()) return;
     unsigned budget = PANIC_BATCH;
     const uint8_t controllers[] = {64, 120, 123};
-    for (uint8_t ch = 0; ch < 16; ch++) {
+    for (uint8_t ch = 0; ch < PLAYER_CHANNELS; ch++) {
         for (uint8_t i = 0; i < 3; i++) {
             if (!(s_panic_cc[cable][ch] & (1U << i))) continue;
             uint8_t msg[] = {(uint8_t)(0xB0 | ch), controllers[i], 0};
@@ -194,7 +202,7 @@ static void flush_pending_note_offs(uint8_t cable)
 
 static void usb_send_panic_cable(uint8_t cable)
 {
-    for (uint8_t ch = 0; ch < 16; ch++) {
+    for (uint8_t ch = 0; ch < PLAYER_CHANNELS; ch++) {
         for (uint8_t w = 0; w < 2; w++) {
             s_pending_note_off[cable][ch][w] |= s_active_notes[cable][ch][w];
             s_active_notes[cable][ch][w] = 0;
@@ -263,6 +271,13 @@ static bool usb_packet_to_message(const uint8_t pkt[4], midi_msg_t *out)
     out->cable_num = cable_num;
     out->len = len;
     memcpy(out->data, &pkt[1], len);
+    if (out->data[0] >= 0x80 && out->data[0] < 0xF0) {
+        uint8_t channel = out->data[0] & 15;
+        /* Live can echo the same Remote message on both output ports.
+         * Keep only this performer's namespace, then restore local channels. */
+        if (channel / PLAYER_CHANNELS != cable_num) return false;
+        out->data[0] = (out->data[0] & 0xF0) | (channel % PLAYER_CHANNELS);
+    }
     out->rx_time_us = esp_timer_get_time();
     return true;
 }
@@ -313,7 +328,7 @@ static void shadow_replay(uint8_t cable)
     const uint8_t *msgs[MIDI_BATCH_MAX];
     uint8_t n = 0;
     uint16_t cursor = s_replay_cursor[cable];
-    while (cursor < 16 * 129 && n < MIDI_BATCH_MAX) {
+    while (cursor < PLAYER_CHANNELS * 129 && n < MIDI_BATCH_MAX) {
         uint8_t ch = cursor / 129, cc = cursor % 129;
         cursor++;
         portENTER_CRITICAL(&s_shadow_lock);
@@ -329,7 +344,7 @@ static void shadow_replay(uint8_t cable)
     }
     if (n && ble_midi_link_send(cable, msgs, lens, n) != ESP_OK) return;
     s_replay_cursor[cable] = cursor;
-    if (cursor == 16 * 129) {
+    if (cursor == PLAYER_CHANNELS * 129) {
         s_shadow_replay_completed[cable] = request;
         s_replay_cursor[cable] = 0;
     }
@@ -338,6 +353,11 @@ static void shadow_replay(uint8_t cable)
 static void process_ble_message(const midi_msg_t *msg)
 {
     uint8_t c = msg->cable_num;
+    if (msg->data[0] >= 0x80 && msg->data[0] < 0xF0 &&
+        (msg->data[0] & 15) >= PLAYER_CHANNELS) {
+        s_ble_to_usb_dropped++;
+        return;
+    }
     portENTER_CRITICAL(&s_note_lock);
     bool stale = msg->recovery_epoch != s_recovery_epoch[c] || s_recovery_requested[c];
     portEXIT_CRITICAL(&s_note_lock);
@@ -596,6 +616,11 @@ esp_err_t midi_bridge_start(void)
 void midi_bridge_on_ble_midi(uint8_t cable_num, const uint8_t *msg, uint8_t len, int64_t rx_time_us)
 {
     if (msg == NULL || len == 0 || len > MIDI_MSG_MAX_LEN || cable_num >= USB_MIDI_CABLE_COUNT) {
+        s_ble_rx_dropped++;
+        return;
+    }
+
+    if (msg[0] >= 0x80 && msg[0] < 0xF0 && (msg[0] & 15) >= PLAYER_CHANNELS) {
         s_ble_rx_dropped++;
         return;
     }

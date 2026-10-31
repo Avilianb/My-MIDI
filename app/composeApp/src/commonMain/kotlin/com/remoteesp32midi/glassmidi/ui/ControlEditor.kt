@@ -34,6 +34,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.kyant.backdrop.Backdrop
 import com.remoteesp32midi.glassmidi.model.Control
+import com.remoteesp32midi.glassmidi.model.usbMidiChannel
 import com.remoteesp32midi.glassmidi.model.ButtonBehavior
 import com.remoteesp32midi.glassmidi.model.CONTROLS_PER_STRIP
 import com.remoteesp32midi.glassmidi.model.presetStripCcNumber
@@ -55,6 +56,7 @@ fun ControlEditor(
     onSave: (Control) -> String?,
     onDelete: (() -> Unit)? = null,
     allowKindChange: Boolean = false,
+    devicePort: Int = 0,
 ) {
     val controlIndex = remember(initial.id, allControls) {
         allControls.indexOfFirst { it.id == initial.id }.coerceAtLeast(0)
@@ -62,6 +64,7 @@ fun ControlEditor(
     val stripIndex = controlIndex / CONTROLS_PER_STRIP
     val slotIndex = controlIndex % CONTROLS_PER_STRIP
     val lockedChannel = initial.mapping.channel
+    val wireChannel = usbMidiChannel(devicePort, lockedChannel)
     val defaultCcNumber = presetStripCcNumber(stripIndex, slotIndex)
     val defaultNoteNumber = presetStripNoteNumber(stripIndex)
     val canUsePitchBend = initial.kind == ControlKind.FADER && (stripIndex / 16 == 0)
@@ -161,7 +164,7 @@ fun ControlEditor(
 
                 when (initial.kind) {
                     ControlKind.FADER -> {
-                        FieldLabel("推子信号模式（通道 CH $lockedChannel 自动锁定）")
+                        FieldLabel("推子信号模式（通道 CH $wireChannel 自动锁定）")
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             if (canUsePitchBend) {
                                 GlassPill(
@@ -213,7 +216,7 @@ fun ControlEditor(
                     }
 
                     ControlKind.KNOB -> {
-                        FieldLabel("旋钮精度模式（CH $lockedChannel）")
+                        FieldLabel("旋钮精度模式（CH $wireChannel）")
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             GlassPill(
                                 text = "7-bit CC（通用推荐）",
@@ -260,7 +263,7 @@ fun ControlEditor(
                                 )
                             }
                         }
-                        FieldLabel("按钮信号类型（通道 CH $lockedChannel 自动锁定）")
+                        FieldLabel("按钮信号类型（通道 CH $wireChannel 自动锁定）")
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             GlassPill(
                                 text = "Note（音符）",
@@ -329,7 +332,7 @@ fun ControlEditor(
                         .padding(horizontal = 14.dp, vertical = 10.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    PresetRow("锁定 MIDI 通道", "CH ${mapping.channel}")
+                    PresetRow("锁定 MIDI 通道", "CH ${usbMidiChannel(devicePort, mapping.channel)}")
                     val mappingDesc = when (mapping.type) {
                         MidiType.CC -> if (mapping.resolution == MidiResolution.FOURTEEN_BIT) {
                             "14-bit CC ${mapping.number} (LSB ${mapping.number + 32})"

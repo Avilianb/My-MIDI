@@ -21,11 +21,12 @@ void vQueueDelete(QueueHandle_t q){free(q->data);free(q);}
 static bool mounted=true, ready[2]={true,true}, blocked;
 static uint32_t generations[2]={1,1};
 static unsigned sent[2], off[2], cc[2], ble_sent, ble_max;
+static uint8_t last_wire_status[2];
 static int ble_result=ESP_OK;
 bool usb_midi_device_mounted(void){return mounted;}
 uint32_t usb_midi_write(uint8_t c,const uint8_t*d,uint32_t n){
     if(blocked)return 0;
-    sent[c]++;if((d[0]&0xf0)==0x80)off[c]++;if((d[0]&0xf0)==0xb0)cc[c]++;return n;
+    last_wire_status[c]=d[0];sent[c]++;if((d[0]&0xf0)==0x80)off[c]++;if((d[0]&0xf0)==0xb0)cc[c]++;return n;
 }
 uint32_t usb_midi_read_packets(uint8_t*p,uint32_t n){(void)p;(void)n;return 0;}
 bool ble_midi_link_port_ready(uint8_t c){return ready[c];}
@@ -55,7 +56,7 @@ int main(void){
     for(int i=0;i<300 && s_pending_note_off_any[0];i++){
         unsigned before=sent[0];flush_pending_note_offs(0);assert(sent[0]-before<=PANIC_BATCH);
     }
-    assert(!s_pending_note_off_any[0]);assert(cc[0]==48);assert(off[0]==1);assert(sent[1]==0);
+    assert(!s_pending_note_off_any[0]);assert(cc[0]==24);assert(off[0]==1);assert(sent[1]==0);
     puts("PASS panic retains FIFO failures, releases exact notes, bounded work and cable isolation");
     reset();generations[0]++;process_ble_message(&on);assert(sent[0]==0);
     puts("PASS queued old-owner Note On cannot reach new owner");
@@ -76,5 +77,27 @@ int main(void){
     ble_result=ESP_OK;shadow_replay(0);assert(s_replay_cursor[0]==8);
     assert(s_shadow_replay_request[0]!=s_shadow_replay_completed[0]);assert(ble_max<=8);
     puts("PASS replay retries failed batch and bounds each turn to eight messages");
-    puts("5 bridge regression scenarios passed");return 0;
+    reset();on=note(true);on.cable_num=1;process_ble_message(&on);
+    assert(last_wire_status[1]==0x98);assert(sent[0]==0);
+    release=note(false);release.cable_num=1;process_ble_message(&release);
+    assert(last_wire_status[1]==0x88);
+    usb_send_panic_cable(1);
+    for(int i=0;i<100 && s_pending_note_off_any[1];i++)flush_pending_note_offs(1);
+    assert(last_wire_status[1]==0xBF);assert(cc[1]==24);assert(sent[0]==0);
+    puts("PASS player 2 sends Note/CC/panic only on global channels 9..16");
+    reset();
+    midi_msg_t feedback;
+    uint8_t player2_feedback[]={0x1B,0xB8,7,99};
+    assert(usb_packet_to_message(player2_feedback,&feedback));
+    assert(feedback.cable_num==1 && feedback.data[0]==0xB0);
+    player2_feedback[1]=0xB0;
+    assert(!usb_packet_to_message(player2_feedback,&feedback));
+    uint8_t wrong_port[]={0x0B,0xB8,7,99};
+    assert(!usb_packet_to_message(wrong_port,&feedback));
+    puts("PASS global USB feedback returns to correct local channel and never crosses players");
+    reset();on=note(true);on.data[0]=0x98;
+    process_ble_message(&on);assert(sent[0]==0);
+    midi_bridge_on_ble_midi(1,on.data,3,0);assert(s_ble_to_usb->count==0);
+    puts("PASS out-of-range local channels cannot alias another performer's namespace");
+    puts("8 bridge regression scenarios passed");return 0;
 }

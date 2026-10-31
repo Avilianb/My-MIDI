@@ -222,3 +222,7 @@ App 严格使用标准 BLE-MIDI：
 详见 [稳定性审查](../docs/STABILITY_REVIEW.md)。连续发送按映射合并保留最新值；Note、端口握手与按钮 CC 极值保持优先 FIFO；14-bit 对保留为原子组，默认 ATT MTU 23 也不会溢出。单写者等待 `onCharacteristicWrite`，写失败或超时重建连接以触发固件清音。换绑清除旧端口发送积压；编辑/删除/移动正在发声的按钮会释放原映射。布局 AtomicFile 的读写使用 Mutex 串行化。
 
 Android 构建仍使用 JDK 21。新版 SDK 仓库平台包名称为 `platforms;android-37.0`（旧版本 SDK Manager 可能显示 `platforms;android-37`）。
+
+## 0.1.2 双乐手 MIDI 隔离
+
+默认每人4条，最多每人8条。固件把乐手1映射到USB MIDI1–8、乐手2映射到9–16，App仍使用本地1–8并显示实际USB通道。Live普通MIDI Map会合并Remote输入，乐手2旧映射需要重新学习。详见[双乐手路由说明](../docs/DUAL_PLAYER_ROUTING.md)。新版本还修复了扫描状态、失败退出和GATT初始化，不依赖MTU回调才能连接。

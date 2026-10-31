@@ -713,6 +713,92 @@ class ControllerStoreTest {
         assertEquals(listOf(listOf(MidiMessage.portSelect(1, force = true))), transport.sent)
     }
 
+    @Test
+    fun staleScanActionCannotHideLiveOrConnectingSession() = runTest {
+        val transport = FakeTransport()
+        val store = ControllerStore(transport, InMemoryLayoutStore(), backgroundScope)
+        runCurrent()
+        for (phase in listOf(
+            com.remoteesp32midi.glassmidi.ble.ConnectionPhase.READY,
+            com.remoteesp32midi.glassmidi.ble.ConnectionPhase.CONNECTING,
+            com.remoteesp32midi.glassmidi.ble.ConnectionPhase.RECONNECTING,
+        )) {
+            transport.emit(TransportEvent.ConnectionChanged(com.remoteesp32midi.glassmidi.ble.BleConnection(phase = phase)))
+            runCurrent()
+            store.startScan()
+            assertEquals(phase, store.state.value.connection.phase)
+            assertEquals(false, store.state.value.scanning)
+        }
+        assertEquals(0, transport.scanStarts)
+    }
+
+    @Test
+    fun idleScanStillStartsAndFailureLeavesRetryAvailable() = runTest {
+        val transport = FakeTransport()
+        val store = ControllerStore(transport, InMemoryLayoutStore(), backgroundScope)
+        runCurrent()
+        store.startScan()
+        assertEquals(1, transport.scanStarts)
+        assertTrue(store.state.value.scanning)
+        transport.emit(TransportEvent.ConnectionChanged(com.remoteesp32midi.glassmidi.ble.BleConnection(
+            phase = com.remoteesp32midi.glassmidi.ble.ConnectionPhase.ERROR, detail = "扫描失败")))
+        runCurrent()
+        assertEquals(false, store.state.value.scanning)
+        store.startScan()
+        assertEquals(2, transport.scanStarts)
+        assertTrue(store.state.value.scanning)
+    }
+
+    @Test
+    fun defaultFourStripsCanGrowToEightButNeverWrapIntoOtherPlayer() = runTest {
+        val store = ControllerStore(FakeTransport(), InMemoryLayoutStore(), backgroundScope)
+        runCurrent()
+        store.ensureDefaultStrips()
+        assertEquals(4, store.state.value.controls.size / 6)
+        repeat(4) { store.addChannelStrip() }
+        assertEquals(8, store.state.value.controls.size / 6)
+        store.addChannelStrip()
+        assertEquals(8, store.state.value.controls.size / 6)
+        assertNotNull(store.state.value.error)
+        assertEquals((1..8).toList(), store.state.value.controls.chunked(6).map { it[0].mapping.channel })
+    }
+
+    @Test
+    fun playerTwoDisplaysGlobalChannelsWhileBleKeepsLocalChannels() = runTest {
+        val transport = FakeTransport()
+        val store = ControllerStore(transport, InMemoryLayoutStore(), backgroundScope)
+        runCurrent()
+        store.ensureDefaultStrips()
+        store.setDevicePort(1)
+        val fader = store.state.value.controls[0]
+        assertEquals(1, fader.mapping.channel)
+        assertEquals(9, com.remoteesp32midi.glassmidi.model.usbMidiChannel(1, fader.mapping.channel))
+        assertEquals(12, com.remoteesp32midi.glassmidi.model.usbMidiChannel(1, 4))
+        assertEquals(16, com.remoteesp32midi.glassmidi.model.usbMidiChannel(1, 8))
+        store.setContinuousValue(fader.id, 8192)
+        store.flushContinuousValue(fader.id)
+        assertEquals(0xE0, transport.sent.last().single().status)
+    }
+
+    @Test
+    fun oversizedSavedLayoutIsPreservedButCannotSendAliasedControls() = runTest {
+        val controls = (0 until 9).flatMap { strip -> (0 until 6).map { slot ->
+            Control(id = "s${strip}_$slot", label = "s${strip}_$slot",
+                kind = when (slot) { 0 -> ControlKind.FADER; 1, 2, 3 -> ControlKind.KNOB; else -> ControlKind.BUTTON },
+                mapping = com.remoteesp32midi.glassmidi.model.presetStripMapping(strip, slot))
+        } }
+        val transport = FakeTransport()
+        val store = ControllerStore(transport, InMemoryLayoutStore(PersistedState(
+            layout = Layout(controls = controls), mappingSchemeVersion = MAPPING_SCHEME_VERSION)), backgroundScope)
+        runCurrent()
+        assertEquals(controls.map { it.id }, store.state.value.controls.map { it.id })
+        store.buttonDown(controls[4].id)
+        assertTrue(transport.sent.isEmpty())
+        assertNotNull(store.state.value.error)
+        store.deleteChannelStrip(8)
+        assertEquals(8, store.state.value.controls.size / 6)
+    }
+
     private fun androidxMidiMapping(
         type: MidiType,
         channel: Int,
@@ -735,7 +821,8 @@ private class FakeTransport : BleMidiTransport {
         sent += messages
     }
 
-    override fun startScan() = Unit
+    var scanStarts = 0
+    override fun startScan() { scanStarts++ }
     override fun stopScan() = Unit
     override fun connect(address: String) = Unit
     override fun disconnect() = Unit

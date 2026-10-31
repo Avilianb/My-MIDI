@@ -69,6 +69,7 @@ import com.remoteesp32midi.glassmidi.ble.BleDevice
 import com.remoteesp32midi.glassmidi.ble.ConnectionPhase
 import com.remoteesp32midi.glassmidi.model.ChannelStrip
 import com.remoteesp32midi.glassmidi.model.Control
+import com.remoteesp32midi.glassmidi.model.MAX_PLAYER_STRIPS
 import com.remoteesp32midi.glassmidi.model.toChannelStrips
 import com.remoteesp32midi.glassmidi.store.ControllerStore
 import com.remoteesp32midi.glassmidi.store.UiState
@@ -360,6 +361,7 @@ fun GlassMidiApp(
                 },
                 onDelete = null,
                 allowKindChange = false,
+                devicePort = state.devicePort,
             )
         }
 
@@ -438,7 +440,7 @@ private fun MixerPageBar(
                 )
             }
         }
-        if (editMode) {
+        if (editMode && stripsCount < MAX_PLAYER_STRIPS) {
             BankChip(
                 text = "+ 通道",
                 selected = true,
@@ -643,14 +645,14 @@ private fun ConnectionSettingsScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     GlassPill(
-                        text = "乐手 1 · Port 1",
+                        text = "乐手 1 · MIDI 1–8",
                         onClick = { onSelectDevicePort(0) },
                         backdrop = backdrop,
                         selected = state.devicePort == 0,
                         modifier = Modifier.weight(1f),
                     )
                     GlassPill(
-                        text = "乐手 2 · Port 2",
+                        text = "乐手 2 · MIDI 9–16",
                         onClick = { onSelectDevicePort(1) },
                         backdrop = backdrop,
                         selected = state.devicePort == 1,
@@ -680,9 +682,9 @@ private fun ConnectionSettingsScreen(
                 if (state.devices.isEmpty()) {
                     BasicText(
                         if (state.scanning) {
-                            "请确保 ESP32-S3 已上电并处于广播状态"
+                            "请确认设备已上电。连接满两台手机时不会出现在扫描列表，请先在已连接手机里断开。"
                         } else {
-                            "点击上方「扫描设备」搜索附近的 ESP32-S3 MIDI"
+                            "点击「扫描设备」搜索。设备最多连接两台手机，连接满后需先释放一个连接。"
                         },
                         style = TextStyle(GlassMuted, 11.sp),
                     )
@@ -773,7 +775,7 @@ private fun Hairline() {
 }
 
 private fun UiState.connectionTitle(): String = when (connection.phase) {
-    ConnectionPhase.READY -> "已连接 · Port ${devicePort + 1}"
+    ConnectionPhase.READY -> "已连接 · Port ${devicePort + 1} · MIDI ${devicePort * 8 + 1}–${devicePort * 8 + 8}"
     ConnectionPhase.SCANNING -> "正在扫描"
     ConnectionPhase.CONNECTING -> "连接中"
     ConnectionPhase.RECONNECTING -> "正在重连"

@@ -271,3 +271,7 @@ sh firmware/tests/run_host_tests.sh
 ```
 
 串口路径以实际枚举为准。测试在实际桥接 C 源码上模拟 FIFO 满载，使用 AddressSanitizer/UndefinedBehaviorSanitizer 检查。
+
+## 0.1.2 双乐手通道范围
+
+每个端口现在使用8个本地BLE通道：Port1输出MIDI1–8，Port2输出9–16；USB回传按端口过滤并反向转换。每端口清音由48条变为24条CC，加未释放音符的逐音Off，且只作用于该乐手的全局通道。旧版的“每端口独立16通道”说明已由此修订取代。默认各4条、最多各8条，详见[双乐手路由说明](../docs/DUAL_PLAYER_ROUTING.md)。

@@ -37,6 +37,22 @@ class MidiSendQueueTest {
         assertEquals(listOf(MidiMessage.portSelect(1, true)), queue.poll())
         assertNull(queue.poll())
     }
+    @Test fun defaultMtuBatchesKeepFourFourteenBitControlsComplete() {
+        val queue = MidiSendQueue()
+        val messages = (1..4).flatMap { channel -> listOf(
+            MidiMessage.controlChange(channel, 7, 64),
+            MidiMessage.controlChange(channel, 39, 63),
+        ) }
+        assertTrue(queue.offer(messages))
+        val delivered = mutableListOf<MidiMessage>()
+        while (true) {
+            val batch = queue.poll(maxMessages = 4) ?: break
+            assertTrue(BleMidiCodec().encode(batch, 0).size <= 20)
+            assertEquals(0, batch.size % 2)
+            delivered.addAll(batch)
+        }
+        assertEquals(messages, delivered)
+    }
     @Test fun priorityOverflowRequiresRecoveryInsteadOfSilentReleaseLoss() {
         val queue = MidiSendQueue(priorityCapacity = 1)
         assertTrue(queue.offer(listOf(MidiMessage.noteOn(1, 60, 127))))

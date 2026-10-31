@@ -68,6 +68,7 @@ static ble_midi_rx_cb_t s_rx_cb;
 static uint16_t s_midi_chr_val_handle;
 static uint8_t s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
 static bool s_synced;
+static bool s_adv_configured;
 static _Atomic bool s_start_requested;
 static struct ble_npl_callout s_adv_retry;
 static struct ble_npl_callout s_assignment_retry;
@@ -521,56 +522,62 @@ static void start_advertising_if_needed(void)
         return;
     }
 
-    /* Allocation/controller failures should not leave reconnection unavailable. */
+    /* Reuse the configured set. The last connection can already be reserved
+     * by the controller before GAP CONNECT updates our application slots. */
     ble_npl_callout_reset(&s_adv_retry, ble_npl_time_ms_to_ticks32(1000));
-    struct ble_gap_ext_adv_params adv_params;
-    memset(&adv_params, 0, sizeof(adv_params));
-    adv_params.connectable = 1;
-    adv_params.scannable = 1;
-    adv_params.legacy_pdu = 1;
-    adv_params.own_addr_type = s_own_addr_type;
-    adv_params.primary_phy = BLE_HCI_LE_PHY_1M;
-    adv_params.secondary_phy = BLE_HCI_LE_PHY_1M;
-    adv_params.sid = 0;
-    adv_params.itvl_min = 0x100; /* 160 ms */
-    adv_params.itvl_max = 0x100;
-    adv_params.tx_power = 127;
+    int rc;
+    if (!s_adv_configured) {
+        struct ble_gap_ext_adv_params adv_params;
+        memset(&adv_params, 0, sizeof(adv_params));
+        adv_params.connectable = 1;
+        adv_params.scannable = 1;
+        adv_params.legacy_pdu = 1;
+        adv_params.own_addr_type = s_own_addr_type;
+        adv_params.primary_phy = BLE_HCI_LE_PHY_1M;
+        adv_params.secondary_phy = BLE_HCI_LE_PHY_1M;
+        adv_params.sid = 0;
+        adv_params.itvl_min = 0xA0; /* 100 ms discovery interval */
+        adv_params.itvl_max = 0xA0;
+        adv_params.tx_power = 127;
 
-    int rc = ble_gap_ext_adv_configure(BLE_ADV_INSTANCE, &adv_params, NULL,
-                                       ble_midi_gap_event, NULL);
-    if (rc == BLE_HS_EBUSY) {
-        ble_gap_ext_adv_stop(BLE_ADV_INSTANCE);
         rc = ble_gap_ext_adv_configure(BLE_ADV_INSTANCE, &adv_params, NULL,
-                                       ble_midi_gap_event, NULL);
-    }
-    if (rc != 0) {
-        ESP_LOGE(TAG, "ext_adv_configure failed rc=%d", rc);
-        return;
-    }
+                                           ble_midi_gap_event, NULL);
+        if (rc == BLE_HS_EBUSY) {
+            ble_gap_ext_adv_stop(BLE_ADV_INSTANCE);
+            rc = ble_gap_ext_adv_configure(BLE_ADV_INSTANCE, &adv_params, NULL,
+                                           ble_midi_gap_event, NULL);
+        }
+        if (rc != 0) {
+            ESP_LOGE(TAG, "ext_adv_configure failed rc=%d", rc);
+            return;
+        }
 
-    struct os_mbuf *data = os_msys_get_pkthdr(sizeof(s_ext_adv_data), 0);
-    if (data == NULL) {
-        ESP_LOGE(TAG, "ext_adv mbuf alloc failed");
-        return;
-    }
-    rc = os_mbuf_append(data, s_ext_adv_data, sizeof(s_ext_adv_data));
-    if (rc != 0) {
-        os_mbuf_free_chain(data);
-        ESP_LOGE(TAG, "ext_adv mbuf append failed rc=%d", rc);
-        return;
-    }
-    rc = ble_gap_ext_adv_set_data(BLE_ADV_INSTANCE, data);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "ext_adv_set_data failed rc=%d", rc);
-        return;
-    }
+        struct os_mbuf *data = os_msys_get_pkthdr(sizeof(s_ext_adv_data), 0);
+        if (data == NULL) {
+            ESP_LOGE(TAG, "ext_adv mbuf alloc failed");
+            return;
+        }
+        rc = os_mbuf_append(data, s_ext_adv_data, sizeof(s_ext_adv_data));
+        if (rc != 0) {
+            os_mbuf_free_chain(data);
+            ESP_LOGE(TAG, "ext_adv mbuf append failed rc=%d", rc);
+            return;
+        }
+        rc = ble_gap_ext_adv_set_data(BLE_ADV_INSTANCE, data);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "ext_adv_set_data failed rc=%d", rc);
+            return;
+        }
 
-    struct os_mbuf *rsp = ble_hs_mbuf_from_flat(s_scan_rsp_data, sizeof(s_scan_rsp_data));
-    if (rsp == NULL) return;
-    rc = ble_gap_ext_adv_rsp_set_data(BLE_ADV_INSTANCE, rsp);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "scan response failed rc=%d", rc);
-        return;
+        struct os_mbuf *rsp = ble_hs_mbuf_from_flat(s_scan_rsp_data, sizeof(s_scan_rsp_data));
+        if (rsp == NULL) return;
+        rc = ble_gap_ext_adv_rsp_set_data(BLE_ADV_INSTANCE, rsp);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "scan response failed rc=%d", rc);
+            return;
+        }
+
+        s_adv_configured = true;
     }
 
     rc = ble_gap_ext_adv_start(BLE_ADV_INSTANCE, 0, 0);
@@ -591,7 +598,7 @@ static int ble_midi_gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_CONNECT: {
         if (event->connect.status != 0) {
             ESP_LOGW(TAG, "connect failed status=%d", event->connect.status);
-            start_advertising_if_needed();
+            ble_npl_callout_reset(&s_adv_retry, ble_npl_time_ms_to_ticks32(50));
             return 0;
         }
 
@@ -628,21 +635,16 @@ static int ble_midi_gap_event(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "connected slot=%d handle=%u default_cable=%u (connected=%d/%d)",
                  slot_idx, handle, default_cable, total_connected, BLE_MIDI_MAX_PORTS);
 
-        struct ble_gap_upd_params params = {
-            .itvl_min = 6,              /* 7.5 ms */
-            .itvl_max = 12,             /* 15 ms */
-            .latency = 0,
-            .supervision_timeout = 400, /* 4 s */
-            .min_ce_len = 0,
-            .max_ce_len = 0,
-        };
-        ble_gap_update_params(handle, &params);
-        ble_gap_set_prefered_le_phy(handle, BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK, 0);
-        ble_hs_hci_util_set_data_len(handle, 251, 2120);
-        ble_gattc_exchange_mtu(handle, NULL, NULL);
-
-        /* 若还没连满 2 台手机，立即重新开启广播等待第 2 台手机连入 */
-        start_advertising_if_needed();
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(handle, &desc) == 0) {
+            const uint8_t *peer = desc.peer_ota_addr.val;
+            ESP_LOGI(TAG, "handle=%u peer=%02x:%02x:%02x:%02x:%02x:%02x interval=%u latency=%u timeout=%u",
+                     handle, peer[5], peer[4], peer[3], peer[2], peer[1], peer[0],
+                     desc.conn_itvl, desc.conn_latency, desc.supervision_timeout);
+        }
+        /* Let the central serialize MTU / PHY / connection-parameter setup.
+         * Starting all four procedures here raced Android's own setup. */
+        ble_npl_callout_reset(&s_adv_retry, ble_npl_time_ms_to_ticks32(10));
         return 0;
     }
 
@@ -662,7 +664,7 @@ static int ble_midi_gap_event(struct ble_gap_event *event, void *arg)
             ESP_LOGI(TAG, "disconnected slot=%d handle=%u cable=%u reason=0x%04x",
                      slot_idx, handle, old_cable, event->disconnect.reason);
         }
-        start_advertising_if_needed();
+        ble_npl_callout_reset(&s_adv_retry, ble_npl_time_ms_to_ticks32(10));
         return 0;
     }
 
@@ -711,8 +713,20 @@ static int ble_midi_gap_event(struct ble_gap_event *event, void *arg)
     }
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
-        start_advertising_if_needed();
+        /* reason=0 precedes GAP CONNECT; the connection pool may already be
+         * full while s_slots still reports a free slot. CONNECT restarts it. */
+        if (event->adv_complete.reason != 0)
+            ble_npl_callout_reset(&s_adv_retry, ble_npl_time_ms_to_ticks32(10));
         return 0;
+
+    case BLE_GAP_EVENT_CONN_UPDATE: {
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0)
+            ESP_LOGI(TAG, "handle=%u conn_update status=%d interval=%u latency=%u timeout=%u",
+                     event->conn_update.conn_handle, event->conn_update.status,
+                     desc.conn_itvl, desc.conn_latency, desc.supervision_timeout);
+        return 0;
+    }
 
     default:
         return 0;
@@ -723,6 +737,7 @@ static void ble_midi_on_reset(int reason)
 {
     ESP_LOGW(TAG, "NimBLE reset reason=%d", reason);
     s_synced = false;
+    s_adv_configured = false;
     portENTER_CRITICAL(&s_slots_lock);
     memset(s_slots, 0, sizeof(s_slots));
     for (int c = 0; c < BLE_MIDI_MAX_PORTS; c++) s_cable_generation[c]++;
@@ -742,7 +757,7 @@ static void ble_midi_on_sync(void)
         return;
     }
     s_synced = true;
-    start_advertising_if_needed();
+    ble_npl_callout_reset(&s_adv_retry, 1);
 }
 
 static void ble_midi_host_task(void *param)
